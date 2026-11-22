@@ -492,6 +492,12 @@ template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,con
     std::vector<int> active;
     std::vector<int> active_counts(ctx.campaign.size());
     std::vector<size_t> active_index(ctx.campaign.size());
+    packed::TimeCells cells;
+    auto end_time=[](const auto& event) {
+        if constexpr (std::is_same_v<std::decay_t<decltype(event)>,packed::TimeCells::Cell>)
+            return event.last;
+        else return event.ts;
+    };
 
     auto person_output=[&](View user,const auto& events,size_t i,size_t event_end,
                            const std::vector<C>& clicks,size_t left,size_t click_end) {
@@ -522,18 +528,27 @@ template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,con
                 int winner=left==right?0:clicks[right-1].campaign;
                 for (int campaign:active) ++totals.at(campaign,day).assists;
                 int64_t session_revenue=0;
+                auto purchase=[&](int price,int cat) {
+                    if (!price) return;
+                    auto& sum=by_category[cat];
+                    if (!sum) touched.push_back(cat);
+                    sum+=price;
+                    session_revenue+=price;
+                };
                 do {
-                    const E& event=events[i++];
-                    int price,cat;
-                    if constexpr (compact) { price=event.price(); cat=event.cat(); }
-                    else { price=event.price; cat=event.cat; }
-                    if (price) {
-                        auto& sum=by_category[cat];
-                        if (!sum) touched.push_back(cat);
-                        sum+=price; session_revenue+=price;
+                    const auto& event=events[i++];
+                    if constexpr (std::is_same_v<std::decay_t<decltype(event)>,packed::TimeCells::Cell>) {
+                        count+=event.count;
+                        for (size_t p=event.first_purchase;p!=SIZE_MAX;p=cells.purchases[p].next) {
+                            auto value=cells.purchases[p].value;
+                            purchase(value&0xffffff,value>>24);
+                        }
+                    } else {
+                        if constexpr (compact) purchase(event.price(),event.cat());
+                        else purchase(event.price,event.cat);
+                        ++count;
                     }
-                    ++count;
-                } while (i<event_end && events[i].ts-events[i-1].ts<=gap);
+                } while (i<event_end && events[i].ts-end_time(events[i-1])<=gap);
                 auto& t=totals.at(winner,day);
                 ++t.sessions; t.revenue+=session_revenue; t.purchasing+=(session_revenue>0);
                 ++sessions; revenue+=session_revenue;
@@ -585,7 +600,12 @@ template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,con
         View user;
         if constexpr (compact) user=packed::name(compact_names[key],text);
         else user=e[start].user;
-        person_output(user,e,start,end,c,click_start,click_end);
+        if constexpr (compact) {
+            if (end-start>=packed::cell_threshold) {
+                cells.build(e.data()+start,e.data()+end,size_t(ctx.end-base));
+                person_output(user,cells.ordered,0,cells.ordered.size(),c,click_start,click_end);
+            } else person_output(user,e,start,end,c,click_start,click_end);
+        } else person_output(user,e,start,end,c,click_start,click_end);
         start=end;
         click_start=click_end;
     }

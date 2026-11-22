@@ -291,43 +291,57 @@ struct Ad { Key user, id; uint32_t ts; int campaign; };
 struct Copy { Key id; uint32_t hash; int32_t ingest; Evt event; };
 static_assert(sizeof(Evt)==16 && sizeof(Copy)==32 && sizeof(Ad)==24);
 
-inline void sort_events(Evt* first,Evt* end,std::unique_ptr<Evt[]>& scratch,size_t& capacity) {
-    const size_t count=end-first;
-    if (count<1024) {
-        std::sort(first,end,[](const Evt& a,const Evt& b){ return a.ts<b.ts; });
-        return;
-    }
-    if (count>capacity) {
-        scratch.reset(new Evt[count]);
-        capacity=count;
-    }
-    constexpr unsigned bits=11, buckets=1<<bits, mask=buckets-1;
-    std::array<std::array<uint32_t,buckets>,3> offsets{};
-    for (auto* at=first;at!=end;++at) {
-        ++offsets[0][at->ts&mask];
-        ++offsets[1][(at->ts>>bits)&mask];
-        ++offsets[2][at->ts>>(2*bits)];
-    }
-    Evt* source=first;
-    Evt* target=scratch.get();
-    for (unsigned pass=0;pass<offsets.size();++pass) {
-        auto& next=offsets[pass];
-        if (next[(source[0].ts>>(pass*bits))&mask]==count) continue;
-        uint32_t sum=0;
-        for (auto& value:next) {
-            const auto size=value;
-            value=sum;
-            sum+=size;
-        }
-        for (size_t i=0;i<count;++i) {
-            const auto row=source[i];
-            target[next[(row.ts>>(pass*bits))&mask]++]=row;
-        }
-        std::swap(source,target);
-    }
-    if (source!=first) std::copy_n(source,count,first);
-}
+#ifndef SHOP_CELL_THRESHOLD
+#define SHOP_CELL_THRESHOLD 128
+#endif
+constexpr size_t cell_threshold=SHOP_CELL_THRESHOLD;
 
+// Events inside one half-hour cell necessarily belong to one session.
+// Across cells the actual first and last timestamps decide the gap.
+struct TimeCells {
+    struct Cell {
+        uint32_t ts=0,last=0;
+        size_t count=0,first_purchase=SIZE_MAX;
+    };
+    struct Purchase { uint32_t value; size_t next; };
+    std::vector<Cell> bins, ordered;
+    std::vector<uint64_t> present;
+    std::vector<Purchase> purchases;
+
+    void build(const Evt* first,const Evt* end,size_t span) {
+        if (bins.empty()) {
+            bins.resize((span-1)/gap+1);
+            present.resize((bins.size()+63)/64);
+        }
+        ordered.clear();
+        purchases.clear();
+        for (auto* at=first;at!=end;++at) {
+            const size_t i=at->ts/gap;
+            auto& cell=bins[i];
+            if (!cell.count) {
+                cell={at->ts,at->ts,0,SIZE_MAX};
+                present[i/64] |= 1ULL<<(i%64);
+            } else {
+                cell.ts=std::min(cell.ts,at->ts);
+                cell.last=std::max(cell.last,at->ts);
+            }
+            ++cell.count;
+            if (at->value) {
+                purchases.push_back({at->value,cell.first_purchase});
+                cell.first_purchase=purchases.size()-1;
+            }
+        }
+        // The bitset visits occupied cells in timestamp order.
+        for (size_t word=0;word<present.size();++word) {
+            for (auto bits=present[word];bits;bits&=bits-1) {
+                auto& cell=bins[64*word+__builtin_ctzll(bits)];
+                ordered.push_back(cell);
+                cell.count=0;
+            }
+            present[word]=0;
+        }
+    }
+};
 
 // Assign local indices, counting-sort rows into one range per person, then
 // sort only within those ranges. A partition's index fits in a small table.
@@ -392,10 +406,9 @@ inline std::vector<Key> group(std::vector<Evt>& events, std::vector<Ad>& clicks)
             start=end;
         }
     };
-    std::unique_ptr<Evt[]> scratch;
-    size_t capacity=0;
-    scatter(events,event_counts,events.size(),[&](Evt* first,Evt* end){
-        sort_events(first,end,scratch,capacity);
+    scatter(events,event_counts,events.size(),[](Evt* first,Evt* end){
+        if (size_t(end-first)<cell_threshold)
+            std::sort(first,end,[](const Evt& a,const Evt& b){ return a.ts<b.ts; });
     });
     scatter(clicks,click_counts,surviving_clicks,[](Ad* first,Ad* end){
         std::sort(first,end,[](const Ad& a,const Ad& b){

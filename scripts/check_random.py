@@ -110,8 +110,44 @@ def trial(root, seed):
         check(root, root, threads)
 
 
+def check_cell_thresholds(root):
+    """Cross the promotion threshold with an exact gap and a gap one ms longer."""
+    for part in ("events", "links", "clicks"):
+        (root / part).mkdir(parents=True)
+    (root / "manifest.json").write_text(json.dumps({
+        "window_start": iso(BASE), "window_end": iso(BASE + 2 * DAY)
+    }))
+    write(root / "products.csv", "product_id category", [("p", "tea")])
+    write(root / "campaigns.csv", "campaign_id channel", [])
+    shards = [[], []]
+    users = []
+    for count in (127, 128, 129):
+        user = f"u{count}"
+        users.append([user, iso(BASE)[:10], 2, count, count * 3, "tea"])
+        timestamps = [BASE] * (count - 2) + [BASE + 1800000, BASE + 3600001]
+        for i, timestamp in enumerate(timestamps):
+            event = f"{user}-event-{i}"
+            ingest = iso(timestamp)
+            shards[i % 2].append(f'{event},{user},{timestamp},{ingest},purchase,p,3')
+            shards[(i + 1) % 2].append(
+                f'"{event}",other,{timestamp},{iso(timestamp + 1000)},purchase,p,99'
+            )
+    shards[0].append(f'"invalid-earliest",other,bad,{iso(BASE)},view,p,')
+    shards[1].append(f'invalid-earliest,u127,{BASE},{iso(BASE + 1000)},purchase,p,99')
+    header = "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents"
+    for i, rows in enumerate(shards):
+        (root / "events" / f"{i}.csv").write_text("\n".join([header, *rows, ""]))
+    write(root / "user_daily.csv", "user_id day sessions events revenue_cents top_category", users)
+    write(root / "campaign_daily.csv",
+          "campaign_id channel day sessions purchasing_sessions revenue_cents assisted_sessions",
+          [["organic", "organic", iso(BASE)[:10], 6, 6, 1152, 0]])
+    for threads in (1, 8):
+        check(root, root, threads)
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
+        check_cell_thresholds(Path(tmp) / "thresholds")
         for seed in range(20):
             trial(Path(tmp), seed)
     print("20 shuffled seeds matched at both 1 and 8 workers")
