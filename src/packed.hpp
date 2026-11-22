@@ -6,28 +6,43 @@
 namespace packed {
 using Key = uint64_t;
 constexpr uint64_t byte_lanes = 0x7f7f7f7f7f7f7f7fULL;
+constexpr Key view_tag = 1ULL << 63;
+constexpr Key address_mask = (1ULL << 48) - 1;
+
+inline Key mapped_key(View id) {
+    auto address=reinterpret_cast<uintptr_t>(id.data());
+    if ((address&~address_mask) || id.size()>32767) return 0;
+    // Keep the length and mapped address in one word. The caller falls back
+    // to ordinary string views if either exceeds its bit field.
+    return view_tag | (Key(id.size())<<48) | address;
+}
+inline View mapped_name(Key id) {
+    return {reinterpret_cast<const char*>(id&address_mask),size_t((id&~view_tag)>>48)};
+}
 
 // Nine nonzero ASCII bytes fit in 63 bits, with zero padding that preserves
-// both exact identity and byte order. Unsupported IDs select the general path.
+// byte order. Other IDs retain their exact bytes in the mapped input.
 __attribute__((target("bmi2")))
 inline Key key(View id) {
-    if (id.empty() || id.size() > 9) return 0;
+    if (id.empty()) return 0;
+    if (id.size()>9) return mapped_key(id);
     if (id.size() == 9) {
         uint64_t low;
         std::memcpy(&low, id.data(), 8);
         auto last = uint8_t(id[8]);
         if (last == 0 || last > 127 || (low & ~byte_lanes) ||
-            ((low - 0x0101010101010101ULL) & ~low & ~byte_lanes)) return 0;
+            ((low - 0x0101010101010101ULL) & ~low & ~byte_lanes)) return mapped_key(id);
         return (_pext_u64(__builtin_bswap64(low), byte_lanes) << 7) | last;
     }
     Key value = 0;
     for (uint8_t b : id) {
-        if (!b || b > 127) return 0;
+        if (!b || b > 127) return mapped_key(id);
         value = (value << 7) | b;
     }
     return value << (7 * (9 - id.size()));
 }
 inline View name(Key key, std::array<char, 9>& text) {
+    if (key&view_tag) return mapped_name(key);
     size_t n = 0;
     for (unsigned shift = 63; shift != 0; shift -= 7) {
         char next = char((key >> (shift - 7)) & 127);
@@ -36,7 +51,16 @@ inline View name(Key key, std::array<char, 9>& text) {
     }
     return {text.data(), n};
 }
+inline bool same(Key a,Key b) {
+    return a==b || ((a&b&view_tag) && mapped_name(a)==mapped_name(b));
+}
+inline bool less(Key a,Key b) {
+    if (!((a|b)&view_tag)) return a<b;
+    std::array<char,9> left,right;
+    return name(a,left)<name(b,right);
+}
 inline uint64_t hash(Key key) {
+    if (key&view_tag) return std::hash<View>{}(mapped_name(key));
     key ^= key >> 31;
     key *= 0x9e3779b97f4a7c15ULL;
     return key ^ (key >> 29);
@@ -48,14 +72,13 @@ struct Names {
     std::vector<uint64_t> aliases;
     bool fill(const std::vector<View>& chunks,int limit);
     size_t home(Key id) const { return hash(id)&(entries.size()-1); }
-    Key resolve(Key id) const {
-        const auto h=hash(id);
+    Key resolve(Key id,uint64_t h) const {
         if (!aliases.empty()) {
             const size_t bit=h&(aliases.size()*64-1);
             if (!(aliases[bit/64]&(1ULL<<(bit%64)))) return id;
         }
         size_t i=h&(entries.size()-1);
-        while (entries[i].id && entries[i].id!=id) i=(i+1)&(entries.size()-1);
+        while (entries[i].id && !same(entries[i].id,id)) i=(i+1)&(entries.size()-1);
         return entries[i].id ? entries[i].person : id;
     }
 };
@@ -206,7 +229,7 @@ inline bool Names::fill(const std::vector<View>& chunks,int limit) {
             }
         }
         size_t i=home(id);
-        while (entries[i].id && entries[i].id!=id) i=(i+1)&(entries.size()-1);
+        while (entries[i].id && !same(entries[i].id,id)) i=(i+1)&(entries.size()-1);
         if (entries[i].id) return uint32_t(entries[i].person);
         auto index=uint32_t(nodes.size());
         entries[i]={id,index};
@@ -226,13 +249,13 @@ inline bool Names::fill(const std::vector<View>& chunks,int limit) {
         if (nodes[ar].size<nodes[br].size) std::swap(ar,br);
         nodes[br].parent=ar;
         nodes[ar].size+=nodes[br].size;
-        nodes[ar].name=std::min(nodes[ar].name,nodes[br].name);
+        if (less(nodes[br].name,nodes[ar].name)) nodes[ar].name=nodes[br].name;
     }
     if (!getenv("SHOP_NO_ALIAS_FILTER") && entries.size()>=1024)
         aliases.resize(std::min(entries.size()/8,size_t(262144)));
     for (auto& entry:entries) if (entry.id) {
         entry.person=nodes[root(entry.person)].name;
-        if (!aliases.empty() && entry.id!=entry.person) {
+        if (!aliases.empty() && !same(entry.id,entry.person)) {
             const size_t bit=hash(entry.id)&(aliases.size()*64-1);
             aliases[bit/64]|=1ULL<<(bit%64);
         }
@@ -247,8 +270,46 @@ struct Evt {
     int cat() const { return value >> 24; }
 };
 struct Ad { Key user, id; uint32_t ts; int campaign; };
-struct Copy { Key id; Time ingest; Evt event; };
+// Ingest seconds are relative to the window base.
+struct Copy { Key id; uint32_t hash; int32_t ingest; Evt event; };
 static_assert(sizeof(Evt)==16 && sizeof(Copy)==32 && sizeof(Ad)==24);
+
+inline void sort_events(Evt* first,Evt* end,std::unique_ptr<Evt[]>& scratch,size_t& capacity) {
+    const size_t count=end-first;
+    if (count<1024) {
+        std::sort(first,end,[](const Evt& a,const Evt& b){ return a.ts<b.ts; });
+        return;
+    }
+    if (count>capacity) {
+        scratch.reset(new Evt[count]);
+        capacity=count;
+    }
+    constexpr unsigned bits=11, buckets=1<<bits, mask=buckets-1;
+    std::array<std::array<uint32_t,buckets>,3> offsets{};
+    for (auto* at=first;at!=end;++at) {
+        ++offsets[0][at->ts&mask];
+        ++offsets[1][(at->ts>>bits)&mask];
+        ++offsets[2][at->ts>>(2*bits)];
+    }
+    Evt* source=first;
+    Evt* target=scratch.get();
+    for (unsigned pass=0;pass<offsets.size();++pass) {
+        auto& next=offsets[pass];
+        if (next[(source[0].ts>>(pass*bits))&mask]==count) continue;
+        uint32_t sum=0;
+        for (auto& value:next) {
+            const auto size=value;
+            value=sum;
+            sum+=size;
+        }
+        for (size_t i=0;i<count;++i) {
+            const auto row=source[i];
+            target[next[(row.ts>>(pass*bits))&mask]++]=row;
+        }
+        std::swap(source,target);
+    }
+    if (source!=first) std::copy_n(source,count,first);
+}
 
 
 // Assign local indices, counting-sort rows into one range per person, then
@@ -261,7 +322,7 @@ inline std::vector<Key> group(std::vector<Evt>& events, std::vector<Ad>& clicks)
     auto find=[](const std::vector<Entry>& index, Key key) {
         auto mask=index.size()-1;
         size_t at=(hash(key)>>8)&mask;
-        while (index[at].key && index[at].key!=key) at=(at+1)&mask;
+        while (index[at].key && !same(index[at].key,key)) at=(at+1)&mask;
         return at;
     };
     Key previous=0;
@@ -297,7 +358,7 @@ inline std::vector<Key> group(std::vector<Evt>& events, std::vector<Ad>& clicks)
             row.user=UINT64_MAX;
         }
     }
-    auto scatter=[](auto& rows,const std::vector<size_t>& counts,size_t size,auto order) {
+    auto scatter=[](auto& rows,const std::vector<size_t>& counts,size_t size,auto sort_range) {
         auto cursors=counts;
         size_t offset=0;
         for (auto& count:cursors) {
@@ -310,228 +371,32 @@ inline std::vector<Key> group(std::vector<Evt>& events, std::vector<Ad>& clicks)
         rows.swap(grouped);
         size_t start=0;
         for (auto end:cursors) {
-            if (end-start>1) std::sort(rows.begin()+start,rows.begin()+end,order);
+            if (end-start>1) sort_range(rows.data()+start,rows.data()+end);
             start=end;
         }
     };
-    scatter(events,event_counts,events.size(),[](const Evt& a,const Evt& b){ return a.ts<b.ts; });
-    scatter(clicks,click_counts,surviving_clicks,[](const Ad& a,const Ad& b){
-        return a.ts!=b.ts ? a.ts<b.ts : a.id>b.id;
+    std::unique_ptr<Evt[]> scratch;
+    size_t capacity=0;
+    scatter(events,event_counts,events.size(),[&](Evt* first,Evt* end){
+        sort_events(first,end,scratch,capacity);
+    });
+    scatter(clicks,click_counts,surviving_clicks,[](Ad* first,Ad* end){
+        std::sort(first,end,[](const Ad& a,const Ad& b){
+            return a.ts!=b.ts ? a.ts<b.ts : less(b.id,a.id);
+        });
     });
     return names;
 }
 
-struct RunStats {
-    size_t ordered=0, sorted_in_place=0, regrouped=0;
-};
-using EventBuffers=std::vector<std::vector<Evt>>;
-struct EventSpan {
-    Evt* first;
-    size_t length;
-    Evt* begin() const { return first; }
-    size_t size() const { return length; }
-    Evt& operator[](size_t i) const { return first[i]; }
-};
-struct Verified {
-    struct Person {
-        Key name;
-        size_t block, first, count, click_end;
-        bool ordered, split=false;
-    };
-    std::vector<Person> people;
-    std::vector<Evt> regrouped;
-    std::vector<Ad> grouped_clicks;
-    RunStats stats;
-};
-
-// Each person hash shard receives every surviving event for its people,
-// including the non-dense ID overflow. Checking all runs in that shard
-// proves whether a contiguous range contains the whole person's history.
-inline Verified verify_runs(const std::vector<EventSpan>& spans, std::vector<Ad>& clicks) {
-    Verified result;
-    struct Entry { Key key=0; uint32_t person=0; };
-    struct Run { size_t block, start, count; uint32_t person; };
-    std::vector<Entry> index(1024);
-    std::vector<Run> runs;
-    auto slot=[](const std::vector<Entry>& table, Key key) {
-        const size_t mask=table.size()-1;
-        size_t at=(hash(key)>>8)&mask;
-        while (table[at].key && table[at].key!=key) at=(at+1)&mask;
-        return at;
-    };
-    for (size_t block=0;block<spans.size();++block) {
-        const auto events=spans[block];
-        for (size_t start=0; start<events.size();) {
-            const Key name=events[start].user;
-            size_t end=start+1;
-            bool ordered=true;
-            while (end<events.size() && events[end].user==name) {
-                ordered &= events[end-1].ts<=events[end].ts;
-                ++end;
-            }
-            if (result.people.size()*4>=index.size()*3) {
-                std::vector<Entry> bigger(index.size()*2);
-                for (auto entry:index) if (entry.key) bigger[slot(bigger,entry.key)]=entry;
-                index.swap(bigger);
-            }
-            const size_t count=end-start;
-            auto& entry=index[slot(index,name)];
-            if (!entry.key) {
-                entry={name,uint32_t(result.people.size())};
-                result.people.push_back({name,block,start,count,0,ordered});
-            } else {
-                auto& person=result.people[entry.person];
-                if (!person.split) runs.push_back({person.block,person.first,person.count,entry.person});
-                person.split=true;
-                person.count+=count;
-                runs.push_back({block,start,count,entry.person});
-            }
-            start=end;
-        }
-    }
-    if (result.people.empty()) return result;
-
-    size_t split_rows=0;
-    std::vector<size_t> write_offsets(result.people.size());
-    for (size_t i=0;i<result.people.size();++i) {
-        auto& person=result.people[i];
-        if (person.split) {
-            person.first=write_offsets[i]=split_rows;
-            split_rows+=person.count;
-        }
-    }
-    result.regrouped.resize(split_rows);
-    for (const auto& run:runs) {
-        auto& cursor=write_offsets[run.person];
-        std::copy_n(spans[run.block].begin()+run.start,run.count,result.regrouped.begin()+cursor);
-        cursor+=run.count;
-    }
-
-    size_t kept_clicks=0;
-    for (auto& click:clicks) {
-        const auto& entry=index[slot(index,click.user)];
-        if (entry.key) {
-            click.user=entry.person;
-            ++result.people[entry.person].click_end;
-            ++kept_clicks;
-        } else click.user=UINT64_MAX;
-    }
-    size_t click_total=0;
-    for (auto& person:result.people) {
-        const auto count=person.click_end;
-        person.click_end=click_total;
-        click_total+=count;
-    }
-    result.grouped_clicks.resize(kept_clicks);
-    for (const auto& click:clicks) if (click.user!=UINT64_MAX)
-        result.grouped_clicks[result.people[click.user].click_end++]=click;
-
-    size_t click_start=0;
-    for (auto& person:result.people) {
-        if (person.split || !person.ordered) {
-            auto* rows=person.split ? result.regrouped.data() : spans[person.block].begin();
-            auto first=rows+person.first;
-            std::sort(first,first+person.count,[](const Evt& a,const Evt& b){ return a.ts<b.ts; });
-            (person.split ? result.stats.regrouped : result.stats.sorted_in_place)+=person.count;
-        } else result.stats.ordered+=person.count;
-        if (person.click_end-click_start>1)
-            std::sort(result.grouped_clicks.begin()+click_start,
-                      result.grouped_clicks.begin()+person.click_end,[](const Ad& a,const Ad& b) {
-                return a.ts!=b.ts ? a.ts<b.ts : a.id>b.id;
-            });
-        click_start=person.click_end;
-    }
-    return result;
-}
-
 struct Clean {
     Time base;
-    bool dense=false, segmented=false;
     Shards<Evt> events;
-    std::array<EventBuffers,bins> segments;
     Shards<Ad> clicks;
 };
 
-// The public generator applies an invertible 40-bit transformation to IDs.
-// Treat its inverse as a data-derived perfect hash, never as a source of events
-// or links. The complete scan must fit the inferred domain before we use it.
-constexpr Key event_mask=(1ULL<<40)-1;
-constexpr Key multiplier_a=0x9e3779b97f4bULL;
-constexpr Key multiplier_b=0xd6e8feb86659ULL;
-constexpr Key invert_odd(Key value) {
-    Key result=1;
-    for (int i=0;i<6;++i) result*=2-value*result;
-    return result&event_mask;
-}
-constexpr Key inverse_a=invert_odd(multiplier_a), inverse_b=invert_odd(multiplier_b);
-
-__attribute__((target("ssse3")))
-inline Key unwrap_event(View text) {
-    if (text.size()<2 || text.size()>9 || text.front()!='e' ||
-        (text.size()>2 && text[1]=='0')) return UINT64_MAX;
-    text.remove_prefix(1);
-    Key value=0;
-    if (text.size()==8) {
-        uint64_t word;
-        std::memcpy(&word,text.data(),sizeof word);
-        auto bytes=_mm_cvtsi64_si128(word);
-        auto digits=_mm_and_si128(_mm_cmpgt_epi8(bytes,_mm_set1_epi8('0'-1)),
-                                  _mm_cmpgt_epi8(_mm_set1_epi8('9'+1),bytes));
-        auto lower=_mm_and_si128(_mm_cmpgt_epi8(bytes,_mm_set1_epi8('a'-1)),
-                                 _mm_cmpgt_epi8(_mm_set1_epi8('z'+1),bytes));
-        if ((_mm_movemask_epi8(_mm_or_si128(digits,lower))&255)!=255) return UINT64_MAX;
-        auto codes=_mm_sub_epi8(_mm_sub_epi8(bytes,_mm_set1_epi8('0')),
-                                _mm_and_si128(lower,_mm_set1_epi8('a'-'0'-10)));
-        auto pairs=_mm_maddubs_epi16(codes,_mm_set1_epi16(0x0124)); // 36, 1
-        auto quads=_mm_madd_epi16(pairs,_mm_set1_epi32(0x00010510)); // 36², 1
-        auto result=uint64_t(_mm_cvtsi128_si64(quads));
-        value=(result&0xffffffff)*1679616+(result>>32);
-    } else {
-        for (unsigned char c:text) {
-            if (c>='0' && c<='9') value=value*36+(c-'0');
-            else if (c>='a' && c<='z') value=value*36+(c-'a'+10);
-            else return UINT64_MAX;
-        }
-    }
-    if (value>event_mask) return UINT64_MAX;
-    value=(value*inverse_b)&event_mask;
-    return value^(value>>17)^(value>>34);
-}
-inline Key dense_offset(Key value,Key key) {
-    return ((value^key)*inverse_a)&event_mask;
-}
-inline std::optional<Key> infer_event_key(const std::vector<View>& chunks, size_t limit) {
-    std::vector<Key> sample;
-    for (View chunk:chunks) {
-        rows<7>(chunk.substr(0,16384),[&](const auto& fields) {
-            if (sample.size()>=192) return;
-            Key id=unwrap_event(fields[0]);
-            if (id!=UINT64_MAX) sample.push_back(id);
-        });
-        if (sample.size()>=192) break;
-    }
-    std::sort(sample.begin(),sample.end());
-    sample.erase(std::unique(sample.begin(),sample.end()),sample.end());
-    if (sample.size()<32) return {};
-    const Key anchor=sample[sample.size()/2];
-    const Key first=sample[0], second=sample.back();
-    Key mixed=0;
-    for (size_t candidate=0;candidate<limit;++candidate,mixed+=multiplier_a) {
-        const Key key=(mixed^anchor)&event_mask;
-        if (dense_offset(first,key)>=limit || dense_offset(second,key)>=limit) continue;
-        if (std::all_of(sample.begin(),sample.end(),[&](Key id){return dense_offset(id,key)<limit;}))
-            return key;
-    }
-    return {};
-}
-struct DenseCopy { uint32_t id; int32_t ingest; Evt event; };
-static_assert(sizeof(DenseCopy)==24);
-
-template<bool dense>
-bool read_events(const std::vector<View>& chunks,size_t input_bytes,size_t limit,Key event_key,
-                 const Names& names,const std::shared_future<bool>& names_ready,
-                 const Context& ctx,Time base,Shards<Evt>& events,
-                 std::array<EventBuffers,bins>* segments=nullptr) {
+inline bool read_events(const std::vector<View>& chunks,size_t input_bytes,
+                        const Names& names,const std::shared_future<bool>& names_ready,
+                        const Context& ctx,Time base,Shards<Evt>& events) {
     const bool profile=getenv("SHOP_PROFILE")!=nullptr;
     auto last=std::chrono::steady_clock::now();
     auto lap=[&](const char* label) {
@@ -540,51 +405,33 @@ bool read_events(const std::vector<View>& chunks,size_t input_bytes,size_t limit
         std::cerr<<label<<" "<<std::chrono::duration<double>(now-last).count()<<" s\n";
         last=now;
     };
-    constexpr size_t partitions=128;
-    using Candidate=std::conditional_t<dense,DenseCopy,Copy>;
-    std::array<std::vector<Candidate>,partitions> copies;
-    std::vector<Copy> odd;
-    std::mutex odd_lock;
+    constexpr size_t partitions=512;
+    std::array<std::vector<Copy>,partitions> copies;
     std::array<std::mutex,partitions> locks;
     std::array<std::mutex,bins> person_locks;
     std::atomic<bool> incompatible{false};
-    size_t width=1;
-    if constexpr (dense) while (width*partitions<limit) width*=2;
-    const unsigned shift=__builtin_ctzll(width);
-    auto partition=[&](Key id) -> size_t {
-        if constexpr (dense) return id>>shift;
-        else return hash(id)%partitions;
-    };
     // A capacity hint only. Skew and shorter rows can grow any partition.
-    for (auto& part:copies)
-        part.reserve(dense ? width+width/8 : input_bytes/(64*partitions));
-    parallel(chunks.size(),[&](size_t i) {
+    for (auto& part:copies) part.reserve(input_bytes/(72*partitions));
+    std::vector<std::array<std::vector<Copy>,partitions>> staging(workers);
+    parallel_workers(chunks.size(),workers,[&](size_t i,size_t worker) {
         if (incompatible.load(std::memory_order_relaxed)) return;
-        std::array<std::vector<Candidate>,partitions> local;
-        std::vector<Copy> local_odd;
+        auto& local=staging[worker];
         rows<7>(chunks[i],[&](const auto& a) {
             if (a[0].empty()) return;
-            Key id=0;
-            bool direct=false;
+            Key id=key(a[0]);
+            if (!id) {
+                incompatible.store(true,std::memory_order_relaxed);
+                return;
+            }
             const Time ingest=stamp(a[3]);
-            if constexpr (dense) {
-                const Key encoded=unwrap_event(a[0]);
-                direct=encoded!=UINT64_MAX && (id=dense_offset(encoded,event_key))<limit;
-                if (direct && (ingest/1000<INT32_MIN || ingest/1000>INT32_MAX || ingest==invalid)) {
-                    incompatible.store(true,std::memory_order_relaxed);
-                    return;
-                }
+            const Time seconds=ingest/1000-base/1000;
+            if (ingest==invalid || ingest%1000 || seconds<INT32_MIN || seconds>INT32_MAX) {
+                incompatible.store(true,std::memory_order_relaxed);
+                return;
             }
-            if (!direct) {
-                id=key(a[0]);
-                if (!id) { incompatible.store(true,std::memory_order_relaxed); return; }
-            }
-            auto push=[&](Evt event) {
-                if constexpr (dense) {
-                    if (direct) local[partition(id)].push_back({uint32_t(id),int32_t(ingest/1000),event});
-                    else local_odd.push_back({id,ingest,event});
-                } else local[partition(id)].push_back({id,ingest,event});
-            };
+            const auto h=hash(id);
+            auto& partition=local[h%partitions];
+            const auto tag=uint32_t(h/partitions);
             Evt event{};
             if (!a[1].empty() && !a[5].empty() &&
                 (a[4]=="view" || a[4]=="cart" || a[4]=="purchase")) {
@@ -593,7 +440,7 @@ bool read_events(const std::vector<View>& chunks,size_t input_bytes,size_t limit
                     if (a[4]=="purchase") {
                         Time value=decimal(a[6],10000000);
                         if (value<=0) {
-                            push({});
+                            partition.push_back({id,tag,int32_t(seconds),{}});
                             return;
                         }
                         auto p=ctx.products.find(a[5]);
@@ -605,47 +452,38 @@ bool read_events(const std::vector<View>& chunks,size_t input_bytes,size_t limit
                 }
             }
             // A parseable but invalid copy still participates in earliest-ingest dedup.
-            push(event);
+            partition.push_back({id,tag,int32_t(seconds),event});
         });
         for (size_t p=0;p<partitions;++p) if (!local[p].empty()) {
             std::lock_guard lock(locks[p]);
             copies[p].insert(copies[p].end(),local[p].begin(),local[p].end());
-        }
-        if constexpr (dense) if (!local_odd.empty()) {
-            std::lock_guard lock(odd_lock);
-            odd.insert(odd.end(),local_odd.begin(),local_odd.end());
+            local[p].clear();
         }
     });
     if (incompatible.load()) return false;
     lap("event CSV scan and packing");
     if (!names_ready.get()) return false;
-    auto dedup=[&](auto& batch) {
-        using Record=typename std::decay_t<decltype(batch)>::value_type;
-        constexpr bool direct=std::is_same_v<Record,DenseCopy>;
-        Shards<Evt> local;
+    std::vector<Shards<Evt>> routing(workers);
+    parallel_workers(partitions,workers,[&](size_t partition,size_t worker) {
+        auto& batch=copies[partition];
         if (batch.empty()) return;
-        size_t capacity=direct ? width : 1;
-        if constexpr (!direct) while (capacity<batch.size()+batch.size()/2) capacity*=2;
-        std::vector<uint32_t> slots(capacity,0);
-        auto slot_for=[&](Key id) {
-            if constexpr (direct) return id&(width-1);
-            else return (hash(id)/partitions)&(capacity-1);
-        };
+        auto& local=routing[worker];
+        size_t capacity=1;
+        while (capacity<batch.size()+batch.size()/2) capacity*=2;
+        // A tag rejects collisions without loading the candidate or its ID.
+        std::vector<uint64_t> slots(capacity,0);
+        const size_t mask=capacity-1;
         for (size_t i=0;i<batch.size();++i) {
-            if (i+12<batch.size()) {
-                const size_t ahead=slot_for(batch[i+12].id);
-                __builtin_prefetch(&slots[ahead],0,1);
-            }
+            if (i+12<batch.size())
+                __builtin_prefetch(&slots[batch[i+12].hash&mask],0,1);
             const auto& row=batch[i];
-            size_t pos=slot_for(row.id);
-            if constexpr (!direct)
-                while (slots[pos] && batch[slots[pos]-1].id!=row.id) pos=(pos+1)&(capacity-1);
-            if constexpr (direct) {
-                if (!slots[pos] || row.ingest<batch[slots[pos]-1].ingest) slots[pos]=i+1;
-            } else if (!slots[pos]) {
-                slots[pos]=i+1;
+            size_t pos=row.hash&mask;
+            while (slots[pos] && (uint32_t(slots[pos]>>32)!=row.hash ||
+                   !same(batch[uint32_t(slots[pos])-1].id,row.id))) pos=(pos+1)&mask;
+            if (!slots[pos]) {
+                slots[pos]=(uint64_t(row.hash)<<32)|uint32_t(i+1);
             } else {
-                auto& kept=batch[slots[pos]-1];
+                auto& kept=batch[uint32_t(slots[pos])-1];
                 if (row.ingest<kept.ingest) {
                     kept.ingest=row.ingest;
                     kept.event=row.event;
@@ -653,51 +491,23 @@ bool read_events(const std::vector<View>& chunks,size_t input_bytes,size_t limit
                 batch[i].event.user=0;
             }
         }
-        if constexpr (direct) {
-            // Visiting dense IDs in order brings records originally assigned
-            // near each other back together before resolving and grouping names.
-            uint64_t previous=0, person=0;
-            size_t person_bin=0;
-            for (size_t i=0;i<slots.size();++i) {
-                if (i+24<slots.size() && slots[i+24])
-                    __builtin_prefetch(&batch[slots[i+24]-1],0,1);
-                if (!slots[i]) continue;
-                auto event=batch[slots[i]-1].event;
-                if (!event.user) continue;
-                if (previous!=event.user) {
-                    previous=event.user;
-                    person=names.resolve(previous);
-                    person_bin=hash(person)%bins;
-                }
-                event.user=person;
-                local[person_bin].push_back(event);
-            }
-        } else {
-            for (size_t i=0;i<batch.size();++i) {
-                if (i+16<batch.size() && batch[i+16].event.user)
-                    __builtin_prefetch(&names.entries[names.home(batch[i+16].event.user)],0,1);
-                auto event=batch[i].event;
-                if (event.user) {
-                    event.user=names.resolve(event.user);
-                    local[hash(event.user)%bins].push_back(event);
-                }
-            }
+        for (const auto& event:batch) {
+            auto row=event.event;
+            if (!row.user) continue;
+            auto h=hash(row.user);
+            auto person=names.resolve(row.user,h);
+            if (person!=row.user) h=hash(person);
+            row.user=person;
+            local[h%bins].push_back(row);
         }
-        std::vector<Record>().swap(batch);
+        std::vector<Copy>().swap(batch);
         for (size_t b=0;b<bins;++b) if (!local[b].empty()) {
             std::lock_guard lock(person_locks[b]);
-            if (segments) (*segments)[b].push_back(std::move(local[b]));
-            else {
-                auto& dest=events[b];
-                dest.insert(dest.end(),local[b].begin(),local[b].end());
-            }
+            auto& dest=events[b];
+            dest.insert(dest.end(),local[b].begin(),local[b].end());
+            local[b].clear();
         }
-    };
-    parallel(partitions+dense,[&](size_t p) {
-        if (p<partitions) dedup(copies[p]);
-        else dedup(odd);
     });
-
     lap("event dedup and routing");
     return true;
 }
@@ -721,24 +531,15 @@ inline std::optional<Clean> read(Input& input, const fs::path& dir, const Contex
     auto chunks=scan_chunks(input,dir/"events");
     size_t input_bytes=0;
     for (View chunk:chunks) input_bytes+=chunk.size();
-    const size_t limit=std::min(input_bytes/44+1,size_t(1)<<28);
-    std::optional<Key> event_key;
-    if (limit>=100000 && !getenv("SHOP_HASH_IDS")) event_key=infer_event_key(chunks,limit);
-    const bool keep_blocks=!getenv("SHOP_JOIN_EVENT_BLOCKS") && !getenv("SHOP_REGROUP_ALL");
-    bool ready=event_key && read_events<true>(chunks,input_bytes,limit,*event_key,names,names_ready,ctx,base,result.events,
-                                             keep_blocks ? &result.segments : nullptr);
-    result.segmented=ready && keep_blocks;
-    if (getenv("SHOP_PROFILE")) std::cerr<<"dense event table "<<(ready?"active":"inactive")<<'\n';
-    result.dense=ready;
-    if (!names_ready.get()) return {};
-    if (!ready && !read_events<false>(chunks,input_bytes,0,0,names,names_ready,ctx,base,result.events)) return {};
+    if (!read_events(chunks,input_bytes,names,names_ready,ctx,base,result.events)) return {};
 
     std::array<std::mutex,bins> person_locks;
     std::atomic<bool> incompatible{false};
     chunks=scan_chunks(input,dir/"clicks");
-    parallel(chunks.size(),[&](size_t i) {
+    std::vector<Shards<Ad>> routing(workers);
+    parallel_workers(chunks.size(),workers,[&](size_t i,size_t worker) {
         if (incompatible.load(std::memory_order_relaxed)) return;
-        Shards<Ad> local;
+        auto& local=routing[worker];
         rows<4>(chunks[i],[&](const auto& a) {
             if (a[0].empty() || a[1].empty()) return;
             Time ts=stamp(a[3]);
@@ -747,15 +548,18 @@ inline std::optional<Clean> read(Input& input, const fs::path& dir, const Contex
             if (p==ctx.campaigns.end()) return;
             Key user=key(a[1]), id=key(a[0]);
             if (!user || !id) { incompatible.store(true,std::memory_order_relaxed); return; }
-            user=names.resolve(user);
+            auto h=hash(user);
+            auto person=names.resolve(user,h);
+            if (person!=user) h=hash(person);
             // Duplicate click IDs have identical rows. They cannot affect the
             // winning ID or which campaigns are present in a session window.
-            local[hash(user)%bins].push_back({user,id,uint32_t(ts-base),p->second});
+            local[h%bins].push_back({person,id,uint32_t(ts-base),p->second});
         });
         for (size_t b=0;b<bins;++b) if (!local[b].empty()) {
             std::lock_guard lock(person_locks[b]);
             auto& dest=result.clicks[b];
             dest.insert(dest.end(),local[b].begin(),local[b].end());
+            local[b].clear();
         }
     });
     if (incompatible.load()) return {};

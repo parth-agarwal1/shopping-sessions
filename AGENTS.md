@@ -8,7 +8,17 @@ Compile locally with make native. For the scorer image run make fixtures. Build 
 
 Time fresh containers from startup to exit. Use 8 pinned logical CPUs, 24 GB including filesystem cache, no swap, read-only root and input, and uid 1000. Generate 20M/5M and 60M/15M event/click datasets separately with recorded seeds. Record commit, seed, host, cache condition, elapsed time, memory.peak and scratch plus output size. Target 20M below 60 seconds and all three 60M runs below 180 seconds. Report missing measurements explicitly. Compare uncompressed and Snappy output. Optimize only after a profile, change one variable at a time, and re-run exact comparisons. Keep the last verified commit. Never publish datasets, benchmark artifacts or hidden submissions as part of a routine edit.
 
-## Current verification
+## Scorer v5
+
+Use the organizer's current rules, generator and dev answer. The packed path handles opaque variable-width IDs. It encodes up to nine ASCII bytes reversibly and uses an address-and-length token for other IDs. Compare long IDs by their exact bytes for equality, linked minima and click tie order. Keep the mappings alive through output. Tagged deduplication slots use hashes to reject nonmatches before accessing candidates, and compare the complete ID when tags match. The candidate stores whole ingest seconds relative to the window base, with the general path available for inputs outside the compact range.
+
+Worker-local buffers are reused for parsing and routing. Shopper groups of at least 1,024 events use a radix sort on their packed timestamps. Three alternating warm-cache runs per build on eight pinned local CPUs gave medians of 1.44 s for v5 seed 2 at 20M events and 4.79 s for v5 seed 3 at 60M. The previous pinned build (`297ab0c`) took 4.76 s and 16.18 s in single runs on the same inputs. The largest final-run RSS was about 7.57 GiB. These are native measurements. Docker and official scorer timings are pending.
+
+The final candidate passed all 36 official Parquet fixtures and both v5 golden dev tables in default and forced-general modes. The 20M and 60M Parquet tables matched the previous implementation exactly. The independent randomized checker now includes mixed-width and UTF-8 linked IDs and long duplicate event IDs. Re-run it with `make check-native`.
+
+At 60M, the event deduplication and routing phase took about 1.8 s. Keeping candidates in per-worker buffers through deduplication increased peak RSS by about 1.2 GiB at 60M for comparable wall time. Moving survivor blocks into shopper grouping gained about 2% at 60M and lost about 2% at 20M. Both experiments were dropped. The sections below document historical v4 behavior and test switches.
+
+## Historical v4 verification
 
 Run `make check-native` for the dependency-free checks. All 36 official fixtures matched both native tables before Parquet conversion. A separate brute-force reference matched 20 shuffled seeds with one and eight workers. After each algorithm change rerun these checks, then check the actual image and Parquet schemas with the official runner.
 
@@ -18,7 +28,7 @@ Rust was installed locally to build the official generator. Python 3.12 and Pola
 
 The performance branch uses a contiguous linked-ID table, hash tags to avoid unnecessary full ID comparisons on collisions, and 32 deduplication partitions while retaining 128 person partitions. The full local pipeline on official generator seed 2 (20M events and 5M clicks, CPUs 0–7, cached input) took 5.22, 5.20, and 5.25 s, compared with 6.38 s in the original local profile. Both versions' Parquet results matched exactly on seed 2. The optimized version also passed all 36 official Parquet fixtures, both dev tables, and the independent randomized checks. Reparse-after-routing remains expensive, but the trial that parsed before routing used more memory without a repeatable speedup. The date cache and vectorized CSV experiments did not show a repeatable gain over the simpler changes. Re-profile on fresh scorer containers before tuning further.
 
-## Packed native version
+## v4 packed native version
 
 The current candidate builds a single static C++ binary with a direct Parquet writer. On CPUs with AVX2, BMI, BMI2 and POPCNT, it parses CSV with 64-byte delimiter masks, interns short IDs in a reversible order-preserving representation, resolves links with union-find, and uses 32-byte event candidates and 16-byte event survivors. It groups events by person before sorting inside each person's range. Unsupported CPUs and inputs use the original exact engine. Both implementations write the same Parquet schema. No competitor code was imported. The README links the research references.
 
@@ -26,13 +36,13 @@ Use `make fixtures-native` for the direct writer and repeat it with `SHOP_GENERI
 
 With eight pinned host CPUs and a warm page cache, the static executable took 1.89, 1.90, and 2.00 s on official generator seed 2 (20M events and 5M clicks). Seed 3 (60M events and 15M clicks) took 5.73 s at 7,416,524 KiB peak process RSS. Both output tables matched the prior verified implementation at each scale. The static binary passed 36/36 official fixtures and checked exactly against the seed-1 dev answers. The original CSV writer comparison path is available only via the two-argument local CLI. These timings exclude Docker startup and have not been measured on the official scorer.
 
-## Dense event index experiment
+## v4 dense event index experiment
 
 This version uses the invertible multipliers published in the organizer's generator to try a dense index for canonical event IDs. It derives the key fresh from the mounted input. The mapping is injective on accepted IDs, and the choice of dense or hashed storage is a function of the original ID alone. Noncanonical or out-of-range IDs are grouped with exact byte-equivalent keys. No data is inferred from an ID. Ingest time, linked identities, timestamps, and all session outputs still come from the supplied fields and link records.
 
 The static build ran at 1.66, 1.67 and 1.71 s on seed 2 (20M events, eight pinned local CPUs, warm cache), with a 5.03 s run on seed 3 (60M events). Both datasets matched the earlier outputs exactly. The dense index was active on seeds 1, 2, 3 and 6, and the seed-6 dense and forced hash outputs matched. The build passed all 36 Parquet fixtures, both official dev tables, and the independent randomized native checks. Already-sorted detection did not improve repeatable wall time and was dropped. Docker and official timing remain pending.
 
-## Verified shopper runs
+## v4 verified shopper runs
 
 The packed dense path verifies each canonical shopper's event runs within its existing shopper shard. The scan covers all surviving events, including hashed event IDs and linked aliases. It sends an ordered single run directly to the shared session kernel, sorts an unordered single run in place, and copies only shoppers whose events are split across runs. Clicks are grouped by the same canonical shopper and keep their timestamp and click-ID tie order. `SHOP_REGROUP_ALL=1` forces the older grouping path on the same binary.
 
@@ -40,7 +50,7 @@ With warm input and eight pinned local CPUs, three alternating runs of the previ
 
 `SHOP_PROFILE=1` now splits the event preparation phase. On the profiled 20M run, event CSV scanning and packing took 0.34 s, deduplication and routing took 0.29 s, and sessions, aggregation and output took 0.43 s. Try a verified common row-shape decoder as a separate change. Check the full delimiter and quote layout before using fixed offsets, keep the general scanner for all other rows, and compare both tables plus interleaved 20M and 60M timings.
 
-## CSV quote-mask experiment
+## v4 CSV quote-mask experiment
 
 The paired-quote decoder checks field-start and field-end quote masks as a whole and uses exact field offsets. Keep the full mask comparison and single-quote overlap check. Use `SHOP_LEGACY_CSV=1` to select the older extraction loop.
 
@@ -48,7 +58,7 @@ On three alternating warm runs per binary at 20M, medians were 1.57 s before and
 
 For a larger gain, investigate writing each winning event directly into its dense range and processing provably complete ordered shopper runs there. Keep an exact overflow route for cross-range shoppers and outlier IDs. Benchmark moving less data before tuning instruction width. For more public evidence, see [pooled arena benchmarks](https://github.com/matthewf725/shopping-sessions/tree/7272c6f5294e98411422e4734f3e70d7bea52e1f), [in-place duplicate invalidation](https://github.com/axhiao/Shopping-Sessions) and [radix partitioning experiments](https://www.vldb.org/pvldb/vol8/p934-schuhknecht.pdf).
 
-## Buffer handoff and worker reuse
+## v4 buffer handoff and worker reuse
 
 The fast path moves each survivor buffer into its shopper shard without copying or concatenating it. Verification examines all the shard's buffers before emitting a shopper. The identity graph builds alongside event parsing. Routing waits for the resolved graph, and an alias filter skips exact lookups when the ID cannot have a different canonical name.
 

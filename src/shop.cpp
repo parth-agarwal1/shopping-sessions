@@ -148,9 +148,25 @@ Time date_epoch(View s) {
 Time stamp(View s) {
     if ((s.size()!=20 && s.size()!=25) || s[4]!='-')
         return decimal(s,std::numeric_limits<Time>::max());
-    if (s[7]!='-' || s[10]!='T' || s[13]!=':' || s[16]!=':') return invalid;
+    if (s[7]!='-' || s[10]!='T') return invalid;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    uint64_t clock;
+    std::memcpy(&clock,s.data()+11,sizeof clock);
+    // Validate both separators and all six ASCII digits before reducing
+    // the three pairs of decimal digits in independent byte lanes.
+    if ((clock&0xf0f0fff0f0fff0f0ULL)!=0x30303a30303a3030ULL) return invalid;
+    clock&=0x0f0f000f0f000f0fULL;
+    // Adding six carries out of a digit's low nibble only for values 10–15.
+    if ((clock+0x0606000606000606ULL)&0x1010001010001010ULL) return invalid;
+    constexpr uint64_t tens=0x000f00000f00000fULL;
+    clock=(clock&tens)*10+((clock>>8)&tens);
+    int h=uint8_t(clock), min=uint8_t(clock>>24), sec=uint8_t(clock>>48);
+#else
+    if (s[13]!=':' || s[16]!=':') return invalid;
     int h=digits(s,11,2), min=digits(s,14,2), sec=digits(s,17,2);
-    if (h<0 || h>=24 || min<0 || min>=60 || sec<0 || sec>=60) return invalid;
+    if (h<0 || min<0 || sec<0) return invalid;
+#endif
+    if (h>=24 || min>=60 || sec>=60) return invalid;
     // Cache checked dates per thread. A hit requires the entire date prefix.
     struct Date { uint64_t front=0; uint16_t tail=0; Time epoch=invalid; };
     static thread_local std::array<Date,128> days;
@@ -466,8 +482,7 @@ struct UserParts {
     }
 };
 template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,const Context& ctx,
-        CampaignDays& totals,UserParts& out,Time base,bool verified,packed::RunStats& stats,
-        packed::EventBuffers* blocks) {
+        CampaignDays& totals,UserParts& out,Time base) {
     constexpr bool compact=std::is_same_v<E,packed::Evt>;
     auto time_of=[base](const auto& row) { return base+Time(row.ts); };
     std::vector<int64_t> by_category(ctx.categories.size());
@@ -534,25 +549,6 @@ template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,con
 
     std::vector<packed::Key> compact_names;
     if constexpr (compact) {
-        if (verified) {
-            std::vector<packed::EventSpan> spans;
-            if (blocks) {
-                spans.reserve(blocks->size());
-                for (auto& block:*blocks) spans.push_back({block.data(),block.size()});
-            } else if (!e.empty()) spans.push_back({e.data(),e.size()});
-            auto groups=packed::verify_runs(spans,c);
-            stats=groups.stats;
-            size_t click_start=0;
-            for (const auto& person:groups.people) {
-                std::array<char,9> text;
-                auto span=person.split ? packed::EventSpan{groups.regrouped.data(),groups.regrouped.size()}
-                                       : spans[person.block];
-                person_output(packed::name(person.name,text),span,person.first,person.first+person.count,
-                              groups.grouped_clicks,click_start,person.click_end);
-                click_start=person.click_end;
-            }
-            return;
-        }
         compact_names=packed::group(e,c);
     } else {
         // Canonicalize backing addresses so even arbitrary IDs sort as one word.
@@ -613,9 +609,7 @@ int main(int argc,char** argv) try {
         fs::create_directories(stage/"user_daily");
         fs::create_directories(stage/"campaign_daily");
     }
-    auto summarize=[&](auto& events,auto& clicks,Time base,const Context& ctx,bool verified,
-                       std::array<packed::EventBuffers,bins>* segments=nullptr) {
-        std::array<packed::RunStats,bins> stats;
+    auto summarize=[&](auto& events,auto& clicks,Time base,const Context& ctx) {
         const bool dense_totals=!getenv("SHOP_SPARSE_TOTALS");
         std::array<std::unique_ptr<UserParts>,bins> writers;
         std::array<size_t,bins> order;
@@ -623,15 +617,11 @@ int main(int argc,char** argv) try {
         // Start the largest shards first, and keep one writer and totals
         // table per worker so their buffers survive across shard boundaries.
         std::array<size_t,bins> weights;
-        for (size_t b=0;b<bins;++b) {
-            weights[b]=events[b].size()+2*clicks[b].size();
-            if (segments) for (const auto& block:(*segments)[b]) weights[b]+=block.size();
-        }
+        for (size_t b=0;b<bins;++b) weights[b]=events[b].size()+2*clicks[b].size();
         std::sort(order.begin(),order.end(),[&](size_t a,size_t b){ return weights[a]>weights[b]; });
         parallel_workers(bins,workers,[&](size_t item,size_t worker){
             const size_t b=order[item];
-            auto blocks=segments ? &(*segments)[b] : nullptr;
-            if (events[b].empty() && (!blocks || blocks->empty())) {
+            if (events[b].empty()) {
                 std::decay_t<decltype(clicks[b])>().swap(clicks[b]);
                 return;
             }
@@ -639,24 +629,13 @@ int main(int argc,char** argv) try {
             if (!writer) writer=std::make_unique<UserParts>(stage,worker,direct);
             auto& campaign_days=partial[worker];
             campaign_days.prepare(ctx,dense_totals);
-            aggregate(events[b],clicks[b],ctx,campaign_days,*writer,base,verified,stats[b],blocks);
+            aggregate(events[b],clicks[b],ctx,campaign_days,*writer,base);
             if (writer->rows) any_users.store(true,std::memory_order_relaxed);
-            if (blocks) packed::EventBuffers().swap(*blocks);
             std::decay_t<decltype(events[b])>().swap(events[b]);
             std::decay_t<decltype(clicks[b])>().swap(clicks[b]);
         });
         if (any_users.load(std::memory_order_relaxed))
             parallel(workers,[&](size_t i){ if (writers[i]) writers[i]->finish(); });
-        if (verified && getenv("SHOP_PROFILE")) {
-            packed::RunStats total;
-            for (const auto& s:stats) {
-                total.ordered+=s.ordered;
-                total.sorted_in_place+=s.sorted_in_place;
-                total.regrouped+=s.regrouped;
-            }
-            std::cerr<<"shopper rows: ordered "<<total.ordered<<", sorted in place "
-                     <<total.sorted_in_place<<", regrouped "<<total.regrouped<<'\n';
-        }
     };
     Input input; auto ctx=load(input,data); mark("dimensions");
     std::optional<packed::Clean> compact;
@@ -666,16 +645,14 @@ int main(int argc,char** argv) try {
         compact=packed::read(mapped,data,ctx);
         if (compact) {
             mark("packed links, events and clicks");
-            summarize(compact->events,compact->clicks,compact->base,ctx,
-                      compact->dense && !getenv("SHOP_REGROUP_ALL"),
-                      compact->segmented ? &compact->segments : nullptr);
+            summarize(compact->events,compact->clicks,compact->base,ctx);
         }
     }
     if (!compact) {
         load_people(input,data/"links",ctx.people);
         auto events=clean<true>(input,data/"events",ctx); mark("general events");
         auto clicks=clean<false>(input,data/"clicks",ctx); mark("general clicks");
-        summarize(events,clicks,0,ctx,false);
+        summarize(events,clicks,0,ctx);
     }
     if (direct && !any_users.load()) {
         UserParts empty(stage,0,true);

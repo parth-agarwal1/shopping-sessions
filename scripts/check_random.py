@@ -26,7 +26,9 @@ def write(path, header, rows):
 
 def trial(root, seed):
     rand = random.Random(seed)
-    groups = [[" ghost", "a", "A", "a\r"], ["b", "b "], ["c"]]
+    groups = [[" ghost across several linked IDs", "a", "A", "a\r"],
+              ["b0000000000000000000000000000000a", "b"],
+              ["c"], ["é00000000000000000000000000000000", "α"]]
     names = {alias: min(group) for group in groups for alias in group}
     rows, clicks, links = [], [], []
     for group in groups:
@@ -37,13 +39,15 @@ def trial(root, seed):
         user = rand.choice(list(names))
         product = rand.choice(["p1", "p2", "other"])
         kind = rand.choice(["view", "cart", "purchase", "purchase", "bad"])
-        row = [str(i), user, str(ts), iso(earliest), kind, product, str(rand.randint(1, 3))]
+        event_id = f"e{i:032x}" if i % 3 == 0 else str(i)
+        row = [event_id, user, str(ts), iso(earliest), kind, product, str(rand.randint(1, 3))]
         rows.append(row)
         if i % 4 == 0:
-            rows.append([str(i), "c", str(ts), iso(earliest + 3000), "purchase", "p2", "9"])
+            rows.append([event_id, "c", str(ts), iso(earliest + 3000), "purchase", "p2", "9"])
     for i in range(140):
         t = BASE + rand.randrange(-8 * 48, 5 * 48) * 1800000
-        row = [str(i), rand.choice(list(names)), rand.choice(["c1", "c2", "bad"]), str(t)]
+        click_id = f"k{i:032x}" if i % 3 == 0 else f"k{i}"
+        row = [click_id, rand.choice(list(names)), rand.choice(["c1", "c2", "bad"]), str(t)]
         clicks.append(row)
         if i % 5 == 0:
             clicks.append(row)

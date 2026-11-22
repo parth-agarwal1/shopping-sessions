@@ -2,6 +2,7 @@
 // Apache Parquet PLAIN and RLE encoding specifications.
 #pragma once
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
@@ -22,10 +23,16 @@ inline void varint(Bytes& bytes, uint64_t n) {
     bytes.push_back(uint8_t(n));
 }
 inline void little(Bytes& bytes, uint64_t value, unsigned width) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    const auto start=bytes.size();
+    bytes.resize(start+width);
+    std::memcpy(bytes.data()+start,&value,width);
+#else
     for (unsigned i = 0; i < width; ++i) {
         bytes.push_back(uint8_t(value));
         value >>= 8;
     }
+#endif
 }
 
 namespace thrift {
