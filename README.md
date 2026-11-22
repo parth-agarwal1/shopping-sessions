@@ -8,6 +8,8 @@ The CSV scanner validates whole-field quotes from the row's separator and quote 
 
 Event deduplication and click parsing share workers once the identity graph is ready. Workers then group surviving events by shopper and sort by timestamp. Large event groups use a radix sort. Workers start the largest shopper shards first and reuse their campaign counters and Parquet buffers. Campaign totals use a bounded array when the day and campaign range fits, with a sparse map for larger ranges. `SHOP_PROFILE=1` reports stage timings. Use a fresh output directory for each run.
 
+The Parquet writer encodes shopper session and event counts as signed 32-bit integers when the total surviving event count fits. Aggregation counters and revenue use 64 bits.
+
 ```sh
 make native
 make check-native

@@ -445,10 +445,12 @@ struct UserParts {
     size_t shard, rows=0;
     bool direct;
     std::ofstream stream;
-    parquet::Table table{{"user_id",parquet::String},{"day",parquet::Date},
-        {"sessions",parquet::Int64},{"events",parquet::Int64},{"revenue_cents",parquet::Int64},
-        {"top_category",parquet::String,true}};
-    UserParts(fs::path dir,size_t shard,bool direct):dir(std::move(dir)),shard(shard),direct(direct) {
+    parquet::Table table;
+    UserParts(fs::path dir,size_t shard,bool direct,parquet::Type count_type=parquet::Int32)
+        : dir(std::move(dir)),shard(shard),direct(direct),
+          table{{"user_id",parquet::String},{"day",parquet::Date},
+                {"sessions",count_type},{"events",count_type},{"revenue_cents",parquet::Int64},
+                {"top_category",parquet::String,true}} {
         stream.exceptions(std::ios::badbit|std::ios::failbit);
     }
     void flush() {
@@ -616,8 +618,14 @@ int main(int argc,char** argv) try {
         std::iota(order.begin(),order.end(),0);
         // Start the largest shards first, and keep one writer and totals
         // table per worker so their buffers survive across shard boundaries.
+        size_t total_events=0;
         std::array<size_t,bins> weights;
-        for (size_t b=0;b<bins;++b) weights[b]=events[b].size()+2*clicks[b].size();
+        for (size_t b=0;b<bins;++b) {
+            total_events+=events[b].size();
+            weights[b]=events[b].size()+2*clicks[b].size();
+        }
+        // A shopper's session and event counts cannot exceed all surviving events.
+        const auto count_type=total_events<=INT32_MAX ? parquet::Int32 : parquet::Int64;
         std::sort(order.begin(),order.end(),[&](size_t a,size_t b){ return weights[a]>weights[b]; });
         parallel_workers(bins,workers,[&](size_t item,size_t worker){
             const size_t b=order[item];
@@ -626,7 +634,7 @@ int main(int argc,char** argv) try {
                 return;
             }
             auto& writer=writers[worker];
-            if (!writer) writer=std::make_unique<UserParts>(stage,worker,direct);
+            if (!writer) writer=std::make_unique<UserParts>(stage,worker,direct,count_type);
             auto& campaign_days=partial[worker];
             campaign_days.prepare(ctx,dense_totals);
             aggregate(events[b],clicks[b],ctx,campaign_days,*writer,base);

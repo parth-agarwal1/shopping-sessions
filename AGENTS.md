@@ -26,6 +26,14 @@ Against `8b19459`, alternating on eight pinned local CPUs with warm input, the 2
 
 The direct-to-shopper parse experiment invalidated duplicate payloads in place. Overlapping link construction reduced its runtime, and the existing layout remained faster at both sizes. A sharded graph, a different radix width, a rolling CSV scanner, a special 13-digit timestamp decoder, and compiler tuning gave no repeatable advantage over the selected build. Public engineering notes describe the direct-routing and prefetch ideas. [Kvndoescoding entry](https://github.com/Kvndoescoding/shopping-sessions)
 
+## v5 shard capacity and output sizing
+
+Reserve event shopper shards using the parsed candidate count and click shards using input bytes. The hints only affect capacity. Vectors can grow as needed. Click identity lookups now use the same prefetch-then-resolve approach as event routing. Keep aggregation counters and revenue in 64 bits. The Parquet writer uses signed 32-bit `user_daily` session and event counts when the total surviving event count fits. Otherwise it writes 64-bit counts.
+
+Against `742d6e5`, alternating fresh processes on eight pinned local CPUs with warm input, the 20M v5 seed-2 median fell from 1.21 s to 1.14 s over four runs per build. The 60M v5 seed-3 median fell from 3.79 s to 3.54 s over three runs per build. Peak RSS at 60M fell from about 7.56 GiB to 7.27 GiB. Parquet output used 17% fewer bytes at both sizes. All 36 Parquet fixtures passed with the packed and general paths, the v5 dev answers matched, and both tables matched at 20M and 60M. The hash-collision case passed as well.
+
+Reusing deduplication slot vectors, splitting candidates from payloads, compacting session rows, SIMD bucket probing, Parquet dictionary encoding, and batching assist updates gave no repeatable gain over the selected build. Docker and official scorer timing are pending.
+
 ## Historical v4 verification
 
 Run `make check-native` for the dependency-free checks. All 36 official fixtures matched both native tables before Parquet conversion. A separate brute-force reference matched 20 shuffled seeds with one and eight workers. After each algorithm change rerun these checks, then check the actual image and Parquet schemas with the official runner.

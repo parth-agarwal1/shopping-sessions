@@ -82,7 +82,6 @@ struct Names {
         while (entries[i].id && !same(entries[i].id,id)) i=(i+1)&(entries.size()-1);
         return entries[i].id ? entries[i].person : id;
     }
-    Key resolve(Key id,uint64_t h) const { return might_alias(h) ? resolve_alias(id,h) : id; }
 };
 
 struct Masks { uint64_t comma, quote, newline; };
@@ -423,11 +422,33 @@ struct ClickWork {
     std::vector<Shards<Ad>> routing;
 
     ClickWork(const Names& graph,const Context& data,Time first,Shards<Ad>& clicks,std::vector<View> input)
-        : names(graph),ctx(data),base(first),output(clicks),chunks(std::move(input)),routing(workers) {}
+        : names(graph),ctx(data),base(first),output(clicks),chunks(std::move(input)),routing(workers) {
+        size_t bytes=0;
+        for (View chunk:chunks) bytes+=chunk.size();
+        // Reserve from the average shard size. Skewed shards can grow.
+        const auto hint=bytes/(48*bins);
+        for (auto& shard:output) shard.reserve(hint);
+    }
 
     void parse(size_t i,size_t worker) {
         if (incompatible.load(std::memory_order_relaxed)) return;
         auto& local=routing[worker];
+        struct PendingClick { Ad row; uint64_t hash; bool maybe_alias; };
+        std::array<PendingClick,32> pending;
+        size_t count=0;
+        // Resolve the batch after its identity lookups have been prefetched.
+        auto route=[&] {
+            for (size_t j=0;j<count;++j) {
+                auto item=pending[j];
+                if (item.maybe_alias) {
+                    auto person=names.resolve_alias(item.row.user,item.hash);
+                    if (person!=item.row.user) item.hash=hash(person);
+                    item.row.user=person;
+                }
+                local[item.hash%bins].push_back(item.row);
+            }
+            count=0;
+        };
         rows<4>(chunks[i],[&](const auto& a) {
             if (a[0].empty() || a[1].empty()) return;
             Time ts=stamp(a[3]);
@@ -436,12 +457,14 @@ struct ClickWork {
             if (p==ctx.campaigns.end()) return;
             Key user=key(a[1]), id=key(a[0]);
             if (!user || !id) { incompatible.store(true,std::memory_order_relaxed); return; }
-            auto h=hash(user);
-            auto person=names.resolve(user,h);
-            if (person!=user) h=hash(person);
+            const auto h=hash(user);
+            const bool maybe=names.might_alias(h);
+            if (maybe) __builtin_prefetch(&names.entries[h&(names.entries.size()-1)],0,1);
             // Identical duplicate clicks leave both attribution and assists unchanged.
-            local[h%bins].push_back({person,id,uint32_t(ts-base),p->second});
+            pending[count++]={{user,id,uint32_t(ts-base),p->second},h,maybe};
+            if (count==pending.size()) route();
         });
+        route();
         for (size_t b=0;b<bins;++b) if (!local[b].empty()) {
             std::lock_guard lock(locks[b]);
             auto& dest=output[b];
@@ -521,6 +544,12 @@ inline bool read_records(const std::vector<View>& chunks,size_t input_bytes,
     lap("event CSV scan and packing");
     if (!names_ready.get()) return false;
     std::vector<Shards<Evt>> routing(workers);
+    size_t candidates=0;
+    for (const auto& partition:copies) candidates+=partition.size();
+    // Include headroom for uneven traffic while keeping the hint tied to
+    // parsed rows rather than the width of the input IDs.
+    const auto average=candidates/bins;
+    for (auto& shard:events) shard.reserve(average+average/8);
     auto dedup=[&](size_t partition,size_t worker) {
         auto& batch=copies[partition];
         if (batch.empty()) return;
