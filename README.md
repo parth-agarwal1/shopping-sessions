@@ -6,7 +6,7 @@ On supported x86-64 CPUs, an AVX2 scanner parses CSV into 32-byte event candidat
 
 The CSV scanner validates whole-field quotes from the row's separator and quote masks before extracting fields. Rows with an empty first field, long lines and chunk tails use the general decoder as applicable. `SHOP_LEGACY_CSV=1` switches off quote-mask pairing for A/B checks.
 
-Workers group surviving events by shopper and sort by timestamp. Large event groups use a radix sort. Workers start the largest shopper shards first and reuse their campaign counters and Parquet buffers. Campaign totals use a bounded array when the day and campaign range fits, with a sparse map for larger ranges. `SHOP_PROFILE=1` reports stage timings. Use a fresh output directory for each run.
+Event deduplication and click parsing share workers once the identity graph is ready. Workers then group surviving events by shopper and sort by timestamp. Large event groups use a radix sort. Workers start the largest shopper shards first and reuse their campaign counters and Parquet buffers. Campaign totals use a bounded array when the day and campaign range fits, with a sparse map for larger ranges. `SHOP_PROFILE=1` reports stage timings. Use a fresh output directory for each run.
 
 ```sh
 make native

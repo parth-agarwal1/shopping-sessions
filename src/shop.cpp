@@ -33,7 +33,7 @@ using View = std::string_view;
 using Time = int64_t;
 constexpr Time day_ms = 86400000, week = 7 * day_ms, gap = 1800000;
 constexpr Time invalid = std::numeric_limits<Time>::min();
-constexpr size_t bins = 128;
+constexpr size_t bins = 256;
 // Fewer ID partitions keep successive raw-row reads closer together.
 constexpr size_t id_bins = 32;
 int workers = 8;
@@ -299,7 +299,7 @@ std::vector<View> scan_chunks(Input& input,const fs::path& dir) {
     std::vector<View> chunks;
     for (auto& path:files(dir)) {
         View s=body(input.open(path));
-        constexpr size_t target=2*1024*1024;
+        constexpr size_t target=1024*1024;
         while (s.size()>target) {
             auto cut=s.find('\n',target);
             if (cut==View::npos) break;

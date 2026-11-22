@@ -72,15 +72,17 @@ struct Names {
     std::vector<uint64_t> aliases;
     bool fill(const std::vector<View>& chunks,int limit);
     size_t home(Key id) const { return hash(id)&(entries.size()-1); }
-    Key resolve(Key id,uint64_t h) const {
-        if (!aliases.empty()) {
-            const size_t bit=h&(aliases.size()*64-1);
-            if (!(aliases[bit/64]&(1ULL<<(bit%64)))) return id;
-        }
+    bool might_alias(uint64_t h) const {
+        if (aliases.empty()) return true;
+        const size_t bit=h&(aliases.size()*64-1);
+        return aliases[bit/64]&(1ULL<<(bit%64));
+    }
+    Key resolve_alias(Key id,uint64_t h) const {
         size_t i=h&(entries.size()-1);
         while (entries[i].id && !same(entries[i].id,id)) i=(i+1)&(entries.size()-1);
         return entries[i].id ? entries[i].person : id;
     }
+    Key resolve(Key id,uint64_t h) const { return might_alias(h) ? resolve_alias(id,h) : id; }
 };
 
 struct Masks { uint64_t comma, quote, newline; };
@@ -202,23 +204,31 @@ void rows(View chunk,F consume) {
 }
 
 inline bool Names::fill(const std::vector<View>& chunks,int limit) {
-    std::vector<std::vector<std::pair<Key,Key>>> shards(chunks.size());
+    struct Edge { Key left,right; uint64_t left_hash,right_hash; };
+    std::vector<std::vector<Edge>> shards(chunks.size());
     std::atomic<bool> incompatible{false};
     parallel_workers(chunks.size(),limit,[&](size_t chunk,size_t) {
         auto& edges=shards[chunk];
         rows<2>(chunks[chunk],[&](const auto& f) {
             if (f[0].empty() || f[1].empty()) return;
             Key a=key(f[0]), b=key(f[1]);
-            if (a && b) edges.emplace_back(a,b);
+            if (a && b) edges.push_back({a,b,hash(a),hash(b)});
             else incompatible.store(true,std::memory_order_relaxed);
         });
     });
     if (incompatible.load()) return false;
 
     struct Node { uint32_t parent,size; Key name; };
+    size_t edge_count=0;
+    for (const auto& shard:shards) edge_count+=shard.size();
+    // Reserve from the edge count and grow if more IDs are discovered.
+    const size_t estimate=edge_count+edge_count/2;
     std::vector<Node> nodes;
-    entries.resize(16);
-    auto put=[&](Key id) -> uint32_t {
+    nodes.reserve(estimate);
+    size_t capacity=16;
+    while (capacity/4*3<estimate) capacity*=2;
+    entries.resize(capacity);
+    auto put=[&](Key id,uint64_t h) -> uint32_t {
         if (nodes.size()*4>=entries.size()*3) {
             auto old=std::move(entries);
             entries.resize(2*old.size());
@@ -228,7 +238,7 @@ inline bool Names::fill(const std::vector<View>& chunks,int limit) {
                 entries[i]=entry;
             }
         }
-        size_t i=home(id);
+        size_t i=h&(entries.size()-1);
         while (entries[i].id && !same(entries[i].id,id)) i=(i+1)&(entries.size()-1);
         if (entries[i].id) return uint32_t(entries[i].person);
         auto index=uint32_t(nodes.size());
@@ -243,8 +253,16 @@ inline bool Names::fill(const std::vector<View>& chunks,int limit) {
         }
         return i;
     };
-    for (const auto& edges:shards) for (auto [a,b]:edges) {
-        uint32_t ar=root(put(a)), br=root(put(b));
+    constexpr size_t ahead=12;
+    for (const auto& edges:shards) for (size_t i=0;i<edges.size();++i) {
+        if (i+ahead<edges.size()) {
+            const auto& next=edges[i+ahead];
+            const size_t mask=entries.size()-1;
+            __builtin_prefetch(&entries[next.left_hash&mask],1,1);
+            __builtin_prefetch(&entries[next.right_hash&mask],1,1);
+        }
+        const auto& edge=edges[i];
+        uint32_t ar=root(put(edge.left,edge.left_hash)), br=root(put(edge.right,edge.right_hash));
         if (ar==br) continue;
         if (nodes[ar].size<nodes[br].size) std::swap(ar,br);
         nodes[br].parent=ar;
@@ -394,9 +412,48 @@ struct Clean {
     Shards<Ad> clicks;
 };
 
-inline bool read_events(const std::vector<View>& chunks,size_t input_bytes,
-                        const Names& names,const std::shared_future<bool>& names_ready,
-                        const Context& ctx,Time base,Shards<Evt>& events) {
+struct ClickWork {
+    const Names& names;
+    const Context& ctx;
+    const Time base;
+    Shards<Ad>& output;
+    const std::vector<View> chunks;
+    std::array<std::mutex,bins> locks;
+    std::atomic<bool> incompatible{false};
+    std::vector<Shards<Ad>> routing;
+
+    ClickWork(const Names& graph,const Context& data,Time first,Shards<Ad>& clicks,std::vector<View> input)
+        : names(graph),ctx(data),base(first),output(clicks),chunks(std::move(input)),routing(workers) {}
+
+    void parse(size_t i,size_t worker) {
+        if (incompatible.load(std::memory_order_relaxed)) return;
+        auto& local=routing[worker];
+        rows<4>(chunks[i],[&](const auto& a) {
+            if (a[0].empty() || a[1].empty()) return;
+            Time ts=stamp(a[3]);
+            if (ts<base || ts>=ctx.end) return;
+            auto p=ctx.campaigns.find(a[2]);
+            if (p==ctx.campaigns.end()) return;
+            Key user=key(a[1]), id=key(a[0]);
+            if (!user || !id) { incompatible.store(true,std::memory_order_relaxed); return; }
+            auto h=hash(user);
+            auto person=names.resolve(user,h);
+            if (person!=user) h=hash(person);
+            // Identical duplicate clicks leave both attribution and assists unchanged.
+            local[h%bins].push_back({person,id,uint32_t(ts-base),p->second});
+        });
+        for (size_t b=0;b<bins;++b) if (!local[b].empty()) {
+            std::lock_guard lock(locks[b]);
+            auto& dest=output[b];
+            dest.insert(dest.end(),local[b].begin(),local[b].end());
+            local[b].clear();
+        }
+    }
+};
+
+inline bool read_records(const std::vector<View>& chunks,size_t input_bytes,
+                         const Names& names,const std::shared_future<bool>& names_ready,
+                         const Context& ctx,Time base,Shards<Evt>& events,ClickWork& clicks) {
     const bool profile=getenv("SHOP_PROFILE")!=nullptr;
     auto last=std::chrono::steady_clock::now();
     auto lap=[&](const char* label) {
@@ -464,26 +521,37 @@ inline bool read_events(const std::vector<View>& chunks,size_t input_bytes,
     lap("event CSV scan and packing");
     if (!names_ready.get()) return false;
     std::vector<Shards<Evt>> routing(workers);
-    parallel_workers(partitions,workers,[&](size_t partition,size_t worker) {
+    auto dedup=[&](size_t partition,size_t worker) {
         auto& batch=copies[partition];
         if (batch.empty()) return;
+        if (batch.size()>UINT32_MAX) {
+            incompatible.store(true,std::memory_order_relaxed);
+            return;
+        }
         auto& local=routing[worker];
         size_t capacity=1;
         while (capacity<batch.size()+batch.size()/2) capacity*=2;
-        // A tag rejects collisions without loading the candidate or its ID.
-        std::vector<uint64_t> slots(capacity,0);
+        // Reserve just enough bits for a one-based row index. The remaining
+        // bits hold a hash tag that filters probes before the exact ID check.
+        std::vector<uint32_t> slots(capacity,0);
+        const uint32_t index_mask=UINT32_MAX>>__builtin_clz(uint32_t(batch.size()));
+        const uint32_t tag_mask=~index_mask;
         const size_t mask=capacity-1;
         for (size_t i=0;i<batch.size();++i) {
             if (i+12<batch.size())
                 __builtin_prefetch(&slots[batch[i+12].hash&mask],0,1);
             const auto& row=batch[i];
             size_t pos=row.hash&mask;
-            while (slots[pos] && (uint32_t(slots[pos]>>32)!=row.hash ||
-                   !same(batch[uint32_t(slots[pos])-1].id,row.id))) pos=(pos+1)&mask;
-            if (!slots[pos]) {
-                slots[pos]=(uint64_t(row.hash)<<32)|uint32_t(i+1);
+            auto slot=slots[pos];
+            while (slot && (((slot^row.hash)&tag_mask) ||
+                   !same(batch[(slot&index_mask)-1].id,row.id))) {
+                pos=(pos+1)&mask;
+                slot=slots[pos];
+            }
+            if (!slot) {
+                slots[pos]=(row.hash&tag_mask)|uint32_t(i+1);
             } else {
-                auto& kept=batch[uint32_t(slots[pos])-1];
+                auto& kept=batch[(slot&index_mask)-1];
                 if (row.ingest<kept.ingest) {
                     kept.ingest=row.ingest;
                     kept.event=row.event;
@@ -491,14 +559,39 @@ inline bool read_events(const std::vector<View>& chunks,size_t input_bytes,
                 batch[i].event.user=0;
             }
         }
-        for (const auto& event:batch) {
-            auto row=event.event;
-            if (!row.user) continue;
-            auto h=hash(row.user);
-            auto person=names.resolve(row.user,h);
-            if (person!=row.user) h=hash(person);
-            row.user=person;
-            local[h%bins].push_back(row);
+        // Resolve shopper IDs in batches so the name table loads can
+        // overlap. Long ID bytes for the next batch are also prefetched.
+        constexpr size_t block_size=32;
+        for (size_t offset=0;offset<batch.size();offset+=block_size) {
+            const auto* rows=batch.data()+offset;
+            const auto count=std::min(block_size,batch.size()-offset);
+            std::array<uint64_t,block_size> hashes;
+            std::array<bool,block_size> aliases;
+            const size_t next=std::min(block_size,batch.size()-offset-count);
+            for (size_t i=0;i<next;++i) {
+                const auto id=rows[count+i].event.user;
+                if (id&view_tag) __builtin_prefetch(mapped_name(id).data(),0,1);
+            }
+            for (size_t i=0;i<count;++i) {
+                const auto id=rows[i].event.user;
+                if (!id) continue;
+                const auto h=hash(id);
+                hashes[i]=h;
+                const bool maybe=names.might_alias(h);
+                aliases[i]=maybe;
+                if (maybe) __builtin_prefetch(&names.entries[h&(names.entries.size()-1)],0,1);
+            }
+            for (size_t i=0;i<count;++i) {
+                auto row=rows[i].event;
+                if (!row.user) continue;
+                auto h=hashes[i];
+                if (aliases[i]) {
+                    const auto person=names.resolve_alias(row.user,h);
+                    if (person!=row.user) h=hash(person);
+                    row.user=person;
+                }
+                local[h%bins].push_back(row);
+            }
         }
         std::vector<Copy>().swap(batch);
         for (size_t b=0;b<bins;++b) if (!local[b].empty()) {
@@ -507,9 +600,25 @@ inline bool read_events(const std::vector<View>& chunks,size_t input_bytes,
             dest.insert(dest.end(),local[b].begin(),local[b].end());
             local[b].clear();
         }
+    };
+    struct Job { size_t index; bool click; };
+    std::vector<Job> jobs;
+    jobs.reserve(partitions+clicks.chunks.size());
+    size_t partition=0, click_chunk=0;
+    // Both jobs read the completed graph and write to separate tables.
+    while (partition<partitions || click_chunk<clicks.chunks.size()) {
+        for (int i=0;i<2 && partition<partitions;++i,++partition) {
+            if (!copies[partition].empty()) jobs.push_back({partition,false});
+        }
+        if (click_chunk<clicks.chunks.size()) jobs.push_back({click_chunk++,true});
+    }
+    parallel_workers(jobs.size(),workers,[&](size_t i,size_t worker) {
+        const auto job=jobs[i];
+        if (job.click) clicks.parse(job.index,worker);
+        else dedup(job.index,worker);
     });
-    lap("event dedup and routing");
-    return true;
+    lap("event dedup and click routing");
+    return !incompatible.load() && !clicks.incompatible.load();
 }
 
 inline std::optional<Clean> read(Input& input, const fs::path& dir, const Context& ctx) {
@@ -531,38 +640,8 @@ inline std::optional<Clean> read(Input& input, const fs::path& dir, const Contex
     auto chunks=scan_chunks(input,dir/"events");
     size_t input_bytes=0;
     for (View chunk:chunks) input_bytes+=chunk.size();
-    if (!read_events(chunks,input_bytes,names,names_ready,ctx,base,result.events)) return {};
-
-    std::array<std::mutex,bins> person_locks;
-    std::atomic<bool> incompatible{false};
-    chunks=scan_chunks(input,dir/"clicks");
-    std::vector<Shards<Ad>> routing(workers);
-    parallel_workers(chunks.size(),workers,[&](size_t i,size_t worker) {
-        if (incompatible.load(std::memory_order_relaxed)) return;
-        auto& local=routing[worker];
-        rows<4>(chunks[i],[&](const auto& a) {
-            if (a[0].empty() || a[1].empty()) return;
-            Time ts=stamp(a[3]);
-            if (ts<base || ts>=ctx.end) return;
-            auto p=ctx.campaigns.find(a[2]);
-            if (p==ctx.campaigns.end()) return;
-            Key user=key(a[1]), id=key(a[0]);
-            if (!user || !id) { incompatible.store(true,std::memory_order_relaxed); return; }
-            auto h=hash(user);
-            auto person=names.resolve(user,h);
-            if (person!=user) h=hash(person);
-            // Duplicate click IDs have identical rows. They cannot affect the
-            // winning ID or which campaigns are present in a session window.
-            local[h%bins].push_back({person,id,uint32_t(ts-base),p->second});
-        });
-        for (size_t b=0;b<bins;++b) if (!local[b].empty()) {
-            std::lock_guard lock(person_locks[b]);
-            auto& dest=result.clicks[b];
-            dest.insert(dest.end(),local[b].begin(),local[b].end());
-            local[b].clear();
-        }
-    });
-    if (incompatible.load()) return {};
+    ClickWork clicks(names,ctx,base,result.clicks,scan_chunks(input,dir/"clicks"));
+    if (!read_records(chunks,input_bytes,names,names_ready,ctx,base,result.events,clicks)) return {};
     return result;
 }
 } // namespace packed

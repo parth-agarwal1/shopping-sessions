@@ -16,7 +16,15 @@ Worker-local buffers are reused for parsing and routing. Shopper groups of at le
 
 The final candidate passed all 36 official Parquet fixtures and both v5 golden dev tables in default and forced-general modes. The 20M and 60M Parquet tables matched the previous implementation exactly. The independent randomized checker now includes mixed-width and UTF-8 linked IDs and long duplicate event IDs. Re-run it with `make check-native`.
 
-At 60M, the event deduplication and routing phase took about 1.8 s. Keeping candidates in per-worker buffers through deduplication increased peak RSS by about 1.2 GiB at 60M for comparable wall time. Moving survivor blocks into shopper grouping gained about 2% at 60M and lost about 2% at 20M. Both experiments were dropped. The sections below document historical v4 behavior and test switches.
+At 60M, the event deduplication and routing phase took about 1.8 s. Keeping candidates in per-worker buffers through deduplication increased peak RSS by about 1.2 GiB at 60M for comparable wall time. Moving survivor blocks into shopper grouping gained about 2% at 60M and lost about 2% at 20M. Both experiments were dropped.
+
+## v5 deduplication and identity lookup tuning
+
+Deduplication slots use 32 bits. Each partition reserves enough bits for a one-based row index and uses the remaining bits for a hash tag. A matching tag must still pass byte-exact ID comparison. The packed path falls back if a partition cannot fit its row indices. For graph construction, count the parsed edges before reserving the lookup table and cache each endpoint's hash. Prefetch the initial table slots before probing. Event routing resolves IDs in batches so the graph probes can overlap. Once the graph is ready, event deduplication and click parsing share a worker queue. CSV chunks target 1 MiB, and canonical shoppers use 256 partitions.
+
+Against `8b19459`, alternating on eight pinned local CPUs with warm input, the 20M v5 seed-2 median fell from 1.43 s to 1.22 s over four runs per build. The 60M v5 seed-3 median fell from 4.72 s to 3.82 s over three runs per build. Peak RSS was about 7.56 GiB on those 60M runs. All 36 Parquet fixtures passed in both execution paths, the v5 dev tables matched the golden answers, and both tables matched at 20M and 60M. The packed path with the alias filter disabled matched the general path on v5 seed 905 at 3M events. An independently constructed case with two distinct event IDs sharing a partition and hash tag also matched. Docker and official timing are pending.
+
+The direct-to-shopper parse experiment invalidated duplicate payloads in place. Overlapping link construction reduced its runtime, and the existing layout remained faster at both sizes. A sharded graph, a different radix width, a rolling CSV scanner, a special 13-digit timestamp decoder, and compiler tuning gave no repeatable advantage over the selected build. Public engineering notes describe the direct-routing and prefetch ideas. [Kvndoescoding entry](https://github.com/Kvndoescoding/shopping-sessions)
 
 ## Historical v4 verification
 
