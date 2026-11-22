@@ -6,6 +6,8 @@ On supported x86-64 CPUs, an AVX2 scanner parses CSV into 32-byte event candidat
 
 When compatible event IDs are detected, the engine finds an inverse mapping from the public generator's ID encoding using a sample of the mounted input. The mapping is bijective. Every row is still parsed and deduplicated with the same ingest-time comparison, and IDs outside the dense range go through exact key lookup. If there is no suitable inverse mapping, the packed hash engine handles the entire input. Set `SHOP_HASH_IDS=1` to force that path for comparisons.
 
+After deduplication, the engine checks canonical shoppers within each shopper partition. A complete run in timestamp order is sessionized in place. Unordered single runs are sorted in place, and only shoppers with multiple runs are copied into a new grouping buffer. Set `SHOP_REGROUP_ALL=1` to compare against grouping every event. `SHOP_PROFILE=1` reports coverage and stage timings.
+
 ```sh
 make native
 make check-native

@@ -432,64 +432,34 @@ struct UserParts {
     }
 };
 template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,const Context& ctx,
-        CampaignDays& totals,UserParts& out,Time base) {
+        CampaignDays& totals,UserParts& out,Time base,bool verified,packed::RunStats& stats) {
     constexpr bool compact=std::is_same_v<E,packed::Evt>;
-    std::vector<packed::Key> compact_names;
-    if constexpr (compact) {
-        compact_names=packed::group(e,c);
-    } else {
-        // Canonicalize backing addresses so even arbitrary IDs sort as one word.
-        std::unordered_set<View> names;
-        for (auto& row:e) row.user=*names.insert(row.user).first;
-        for (auto& row:c) row.user=*names.insert(row.user).first;
-    }
-    auto key_of=[](auto& row) {
-        if constexpr (compact) return row.user;
-        else return row.user.data();
-    };
-    auto before=std::less<decltype(key_of(std::declval<E&>()))>{};
-    auto time_of=[base](auto& row) { return base+Time(row.ts); };
-    if constexpr (!compact) {
-        std::sort(e.begin(),e.end(),[&](const E& a,const E& b){
-            if (key_of(a)!=key_of(b)) return before(key_of(a),key_of(b));
-            return a.ts<b.ts;
-        });
-        // Descending click ID puts the smallest ID last in a timestamp group.
-        std::sort(c.begin(),c.end(),[&](const C& a,const C& b){
-            if (key_of(a)!=key_of(b)) return before(key_of(a),key_of(b));
-            return a.ts!=b.ts?a.ts<b.ts:a.id>b.id;
-        });
-    }
-    size_t i=0, cursor=0;
+    auto time_of=[base](const auto& row) { return base+Time(row.ts); };
     std::vector<int64_t> by_category(ctx.categories.size());
     std::vector<int> touched;
     std::vector<int> active;
     std::vector<int> active_counts(ctx.campaign.size());
     std::vector<size_t> active_index(ctx.campaign.size());
-    while (i<e.size()) {
-        auto key=key_of(e[i]);
-        [[maybe_unused]] std::array<char,9> text;
-        View user;
-        if constexpr (compact) user=packed::name(compact_names[key],text);
-        else user=e[i].user;
-        while (cursor<c.size() && before(key_of(c[cursor]),key)) ++cursor;
-        size_t right=cursor,left=cursor;
+
+    auto person_output=[&](View user,const std::vector<E>& events,size_t i,size_t event_end,
+                           const std::vector<C>& clicks,size_t left,size_t click_end) {
+        size_t right=left;
         for (int campaign:active) active_counts[campaign]=0;
         active.clear();
-        while (i<e.size() && key_of(e[i])==key) {
-            int day=utc_day(time_of(e[i]));
+        while (i<event_end) {
+            int day=utc_day(time_of(events[i]));
             int64_t sessions=0,count=0,revenue=0;
             do {
-                Time start=time_of(e[i]);
-                while (right<c.size() && key_of(c[right])==key && time_of(c[right])<=start) {
-                    const int campaign=c[right++].campaign;
+                Time start=time_of(events[i]);
+                while (right<click_end && time_of(clicks[right])<=start) {
+                    const int campaign=clicks[right++].campaign;
                     if (active_counts[campaign]++==0) {
                         active_index[campaign]=active.size();
                         active.push_back(campaign);
                     }
                 }
-                while (left<right && time_of(c[left])<start-week) {
-                    const int campaign=c[left++].campaign;
+                while (left<right && time_of(clicks[left])<start-week) {
+                    const int campaign=clicks[left++].campaign;
                     if (--active_counts[campaign]==0) {
                         const size_t at=active_index[campaign];
                         active[at]=active.back();
@@ -497,11 +467,11 @@ template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,con
                         active.pop_back();
                     }
                 }
-                int winner=left==right?0:c[right-1].campaign;
+                int winner=left==right?0:clicks[right-1].campaign;
                 for (int campaign:active) ++totals[campaign_day(campaign,day)].assists;
                 int64_t session_revenue=0;
                 do {
-                    const E& event=e[i++];
+                    const E& event=events[i++];
                     int price,cat;
                     if constexpr (compact) { price=event.price(); cat=event.cat(); }
                     else { price=event.price; cat=event.cat; }
@@ -511,11 +481,11 @@ template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,con
                         sum+=price; session_revenue+=price;
                     }
                     ++count;
-                } while (i<e.size() && key_of(e[i])==key && e[i].ts-e[i-1].ts<=gap);
+                } while (i<event_end && events[i].ts-events[i-1].ts<=gap);
                 auto& t=totals[campaign_day(winner,day)];
                 ++t.sessions; t.revenue+=session_revenue; t.purchasing+=(session_revenue>0);
                 ++sessions; revenue+=session_revenue;
-            } while (i<e.size() && key_of(e[i])==key && utc_day(time_of(e[i]))==day);
+            } while (i<event_end && utc_day(time_of(events[i]))==day);
             View top; int64_t highest=0;
             for (int k:touched) {
                 if (by_category[k]>highest || (by_category[k]==highest && ctx.categories[k]<top)) {
@@ -525,7 +495,59 @@ template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,con
             }
             touched.clear(); out.write(user,day,sessions,count,revenue,top);
         }
-        cursor=right;
+    };
+
+    std::vector<packed::Key> compact_names;
+    if constexpr (compact) {
+        if (verified) {
+            auto groups=packed::verify_runs(e,c);
+            stats=groups.stats;
+            size_t click_start=0;
+            for (const auto& person:groups.people) {
+                std::array<char,9> text;
+                person_output(packed::name(person.name,text),person.split ? groups.regrouped : e,
+                    person.first,person.first+person.count,groups.grouped_clicks,click_start,person.click_end);
+                click_start=person.click_end;
+            }
+            return;
+        }
+        compact_names=packed::group(e,c);
+    } else {
+        // Canonicalize backing addresses so even arbitrary IDs sort as one word.
+        std::unordered_set<View> names;
+        for (auto& row:e) row.user=*names.insert(row.user).first;
+        for (auto& row:c) row.user=*names.insert(row.user).first;
+    }
+    auto key_of=[](const auto& row) {
+        if constexpr (compact) return row.user;
+        else return row.user.data();
+    };
+    auto before=std::less<decltype(key_of(std::declval<E&>()))>{};
+    if constexpr (!compact) {
+        std::sort(e.begin(),e.end(),[&](const E& a,const E& b){
+            if (key_of(a)!=key_of(b)) return before(key_of(a),key_of(b));
+            return a.ts<b.ts;
+        });
+        std::sort(c.begin(),c.end(),[&](const C& a,const C& b){
+            if (key_of(a)!=key_of(b)) return before(key_of(a),key_of(b));
+            return a.ts!=b.ts?a.ts<b.ts:a.id>b.id;
+        });
+    }
+    size_t click_start=0;
+    for (size_t start=0;start<e.size();) {
+        const auto key=key_of(e[start]);
+        size_t end=start+1;
+        while (end<e.size() && key_of(e[end])==key) ++end;
+        while (click_start<c.size() && before(key_of(c[click_start]),key)) ++click_start;
+        size_t click_end=click_start;
+        while (click_end<c.size() && key_of(c[click_end])==key) ++click_end;
+        [[maybe_unused]] std::array<char,9> text;
+        View user;
+        if constexpr (compact) user=packed::name(compact_names[key],text);
+        else user=e[start].user;
+        person_output(user,e,start,end,c,click_start,click_end);
+        start=end;
+        click_start=click_end;
     }
 }
 int main(int argc,char** argv) try {
@@ -549,15 +571,26 @@ int main(int argc,char** argv) try {
         fs::create_directories(stage/"user_daily");
         fs::create_directories(stage/"campaign_daily");
     }
-    auto summarize=[&](auto& events,auto& clicks,Time base,const Context& ctx) {
+    auto summarize=[&](auto& events,auto& clicks,Time base,const Context& ctx,bool verified) {
+        std::array<packed::RunStats,bins> stats;
         parallel(bins,[&](size_t b){
             UserParts out(stage,b,direct);
-            aggregate(events[b],clicks[b],ctx,partial[b],out,base);
+            aggregate(events[b],clicks[b],ctx,partial[b],out,base,verified,stats[b]);
             if (out.rows) any_users.store(true,std::memory_order_relaxed);
             out.finish();
             std::decay_t<decltype(events[b])>().swap(events[b]);
             std::decay_t<decltype(clicks[b])>().swap(clicks[b]);
         });
+        if (verified && getenv("SHOP_PROFILE")) {
+            packed::RunStats total;
+            for (const auto& s:stats) {
+                total.ordered+=s.ordered;
+                total.sorted_in_place+=s.sorted_in_place;
+                total.regrouped+=s.regrouped;
+            }
+            std::cerr<<"shopper rows: ordered "<<total.ordered<<", sorted in place "
+                     <<total.sorted_in_place<<", regrouped "<<total.regrouped<<'\n';
+        }
     };
     Input input; auto ctx=load(input,data); mark("dimensions");
     std::optional<packed::Clean> compact;
@@ -567,14 +600,15 @@ int main(int argc,char** argv) try {
         compact=packed::read(mapped,data,ctx);
         if (compact) {
             mark("packed links, events and clicks");
-            summarize(compact->events,compact->clicks,compact->base,ctx);
+            summarize(compact->events,compact->clicks,compact->base,ctx,
+                      compact->dense && !getenv("SHOP_REGROUP_ALL"));
         }
     }
     if (!compact) {
         load_people(input,data/"links",ctx.people);
         auto events=clean<true>(input,data/"events",ctx); mark("general events");
         auto clicks=clean<false>(input,data/"clicks",ctx); mark("general clicks");
-        summarize(events,clicks,0,ctx);
+        summarize(events,clicks,0,ctx,false);
     }
     if (direct && !any_users.load()) {
         UserParts empty(stage,0,true);

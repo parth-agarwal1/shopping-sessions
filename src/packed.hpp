@@ -255,8 +255,121 @@ inline std::vector<Key> group(std::vector<Evt>& events, std::vector<Ad>& clicks)
     return names;
 }
 
+struct RunStats {
+    size_t ordered=0, sorted_in_place=0, regrouped=0;
+};
+struct Verified {
+    struct Person {
+        Key name;
+        size_t first, count, click_end;
+        bool ordered, split=false;
+    };
+    std::vector<Person> people;
+    std::vector<Evt> regrouped;
+    std::vector<Ad> grouped_clicks;
+    RunStats stats;
+};
+
+// Each person hash shard receives every surviving event for its people,
+// including the non-dense ID overflow. Checking all runs in that shard
+// proves whether a contiguous range contains the whole person's history.
+inline Verified verify_runs(std::vector<Evt>& events, std::vector<Ad>& clicks) {
+    Verified result;
+    if (events.empty()) return result;
+    struct Entry { Key key=0; uint32_t person=0; };
+    struct Run { size_t start, count; uint32_t person; };
+    std::vector<Entry> index(1024);
+    std::vector<Run> runs;
+    auto slot=[](const std::vector<Entry>& table, Key key) {
+        const size_t mask=table.size()-1;
+        size_t at=(hash(key)>>8)&mask;
+        while (table[at].key && table[at].key!=key) at=(at+1)&mask;
+        return at;
+    };
+    for (size_t start=0; start<events.size();) {
+        const Key name=events[start].user;
+        size_t end=start+1;
+        bool ordered=true;
+        while (end<events.size() && events[end].user==name) {
+            ordered &= events[end-1].ts<=events[end].ts;
+            ++end;
+        }
+        if (result.people.size()*4>=index.size()*3) {
+            std::vector<Entry> bigger(index.size()*2);
+            for (auto entry:index) if (entry.key) bigger[slot(bigger,entry.key)]=entry;
+            index.swap(bigger);
+        }
+        const size_t count=end-start;
+        auto& entry=index[slot(index,name)];
+        if (!entry.key) {
+            entry={name,uint32_t(result.people.size())};
+            result.people.push_back({name,start,count,0,ordered});
+        } else {
+            auto& person=result.people[entry.person];
+            if (!person.split) runs.push_back({person.first,person.count,entry.person});
+            person.split=true;
+            person.count+=count;
+            runs.push_back({start,count,entry.person});
+        }
+        start=end;
+    }
+
+    size_t split_rows=0;
+    std::vector<size_t> write_offsets(result.people.size());
+    for (size_t i=0;i<result.people.size();++i) {
+        auto& person=result.people[i];
+        if (person.split) {
+            person.first=write_offsets[i]=split_rows;
+            split_rows+=person.count;
+        }
+    }
+    result.regrouped.resize(split_rows);
+    for (const auto& run:runs) {
+        auto& cursor=write_offsets[run.person];
+        std::copy_n(events.begin()+run.start,run.count,result.regrouped.begin()+cursor);
+        cursor+=run.count;
+    }
+
+    size_t kept_clicks=0;
+    for (auto& click:clicks) {
+        const auto& entry=index[slot(index,click.user)];
+        if (entry.key) {
+            click.user=entry.person;
+            ++result.people[entry.person].click_end;
+            ++kept_clicks;
+        } else click.user=UINT64_MAX;
+    }
+    size_t click_total=0;
+    for (auto& person:result.people) {
+        const auto count=person.click_end;
+        person.click_end=click_total;
+        click_total+=count;
+    }
+    result.grouped_clicks.resize(kept_clicks);
+    for (const auto& click:clicks) if (click.user!=UINT64_MAX)
+        result.grouped_clicks[result.people[click.user].click_end++]=click;
+
+    size_t click_start=0;
+    for (auto& person:result.people) {
+        if (person.split || !person.ordered) {
+            auto& rows=person.split ? result.regrouped : events;
+            auto first=rows.begin()+person.first;
+            std::sort(first,first+person.count,[](const Evt& a,const Evt& b){ return a.ts<b.ts; });
+            (person.split ? result.stats.regrouped : result.stats.sorted_in_place)+=person.count;
+        } else result.stats.ordered+=person.count;
+        if (person.click_end-click_start>1)
+            std::sort(result.grouped_clicks.begin()+click_start,
+                      result.grouped_clicks.begin()+person.click_end,[](const Ad& a,const Ad& b) {
+                return a.ts!=b.ts ? a.ts<b.ts : a.id>b.id;
+            });
+        click_start=person.click_end;
+    }
+    return result;
+}
+
 struct Clean {
     Time base;
+    bool dense=false;
     Shards<Evt> events;
     Shards<Ad> clicks;
 };
@@ -339,6 +452,14 @@ static_assert(sizeof(DenseCopy)==24);
 template<bool dense>
 bool read_events(const std::vector<View>& chunks,size_t input_bytes,size_t limit,Key event_key,
                  const Names& names,const Context& ctx,Time base,Shards<Evt>& events) {
+    const bool profile=getenv("SHOP_PROFILE")!=nullptr;
+    auto last=std::chrono::steady_clock::now();
+    auto lap=[&](const char* label) {
+        if (!profile) return;
+        const auto now=std::chrono::steady_clock::now();
+        std::cerr<<label<<" "<<std::chrono::duration<double>(now-last).count()<<" s\n";
+        last=now;
+    };
     constexpr size_t partitions=128;
     using Candidate=std::conditional_t<dense,DenseCopy,Copy>;
     std::array<std::vector<Candidate>,partitions> copies;
@@ -416,6 +537,7 @@ bool read_events(const std::vector<View>& chunks,size_t input_bytes,size_t limit
         }
     });
     if (incompatible.load()) return false;
+    lap("event CSV scan and packing");
     auto dedup=[&](auto& batch) {
         using Record=typename std::decay_t<decltype(batch)>::value_type;
         constexpr bool direct=std::is_same_v<Record,DenseCopy>;
@@ -492,6 +614,7 @@ bool read_events(const std::vector<View>& chunks,size_t input_bytes,size_t limit
         else dedup(odd);
     });
 
+    lap("event dedup and routing");
     return true;
 }
 
@@ -512,6 +635,7 @@ inline std::optional<Clean> read(Input& input, const fs::path& dir, const Contex
     if (limit>=100000 && !getenv("SHOP_HASH_IDS")) event_key=infer_event_key(chunks,limit);
     bool ready=event_key && read_events<true>(chunks,input_bytes,limit,*event_key,names,ctx,base,result.events);
     if (getenv("SHOP_PROFILE")) std::cerr<<"dense event table "<<(ready?"active":"inactive")<<'\n';
+    result.dense=ready;
     if (!ready && !read_events<false>(chunks,input_bytes,0,0,names,ctx,base,result.events)) return {};
 
     std::array<std::mutex,bins> person_locks;
