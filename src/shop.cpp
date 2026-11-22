@@ -32,6 +32,8 @@ using Time = int64_t;
 constexpr Time day_ms = 86400000, week = 7 * day_ms, gap = 1800000;
 constexpr Time invalid = std::numeric_limits<Time>::min();
 constexpr size_t bins = 128;
+// Fewer ID partitions keep successive raw-row reads closer together.
+constexpr size_t id_bins = 32;
 int workers = 8;
 size_t bucket(View s) { return std::hash<View>{}(s) % bins; }
 
@@ -143,13 +145,38 @@ Time stamp(View s) {
 }
 
 struct People {
-    std::unordered_map<View,int> ids;
+    // A tag rejects hash collisions without reading the mapped CSV again.
+    struct Entry { View id; int index=0; uint32_t tag=0; };
+    std::vector<Entry> ids = std::vector<Entry>(16);
     std::vector<int> parent, size;
     std::vector<View> name;
-    int add(View v) {
-        auto [it,added]=ids.try_emplace(v,parent.size());
-        if (added) { parent.push_back(it->second); size.push_back(1); name.push_back(v); }
-        return it->second;
+    static size_t probe(const std::vector<Entry>& table,View id,size_t hash) {
+        size_t at=hash&(table.size()-1);
+        uint32_t tag=hash>>32;
+        while (!table[at].id.empty() && (table[at].tag!=tag || table[at].id!=id))
+            at=(at+1)&(table.size()-1);
+        return at;
+    }
+    void grow() {
+        std::vector<Entry> table(ids.size()*2);
+        for (auto entry:ids) if (!entry.id.empty()) {
+            auto hash=std::hash<View>{}(entry.id);
+            table[probe(table,entry.id,hash)]=entry;
+        }
+        ids.swap(table);
+    }
+    int add(View id) {
+        if (parent.size()*4>=ids.size()*3) grow();
+        auto hash=std::hash<View>{}(id);
+        auto& entry=ids[probe(ids,id,hash)];
+        if (entry.id.empty()) {
+            int index=parent.size();
+            entry={id,index,uint32_t(hash>>32)};
+            parent.push_back(index);
+            size.push_back(1);
+            name.push_back(id);
+        }
+        return entry.index;
     }
     int root(int i) {
         while (i!=parent[i]) { parent[i]=parent[parent[i]]; i=parent[i]; }
@@ -161,9 +188,15 @@ struct People {
         if (size[x]<size[y]) std::swap(x,y);
         parent[y]=x; size[x]+=size[y]; name[x]=std::min(name[x],name[y]);
     }
-    void freeze() { for (auto& entry:ids) entry.second=root(entry.second); }
-    View person(View v) const {
-        auto it=ids.find(v); return it==ids.end()?v:name[it->second];
+    void freeze() {
+        for (auto& entry:ids) if (!entry.id.empty()) entry.index=root(entry.index);
+        std::vector<int>().swap(parent);
+        std::vector<int>().swap(size);
+    }
+    View person(View id) const {
+        auto hash=std::hash<View>{}(id);
+        const auto& entry=ids[probe(ids,id,hash)];
+        return entry.id.empty() ? id : name[entry.index];
     }
 };
 struct Context {
@@ -216,7 +249,7 @@ using Clicks=std::vector<Click>;
 template<class T> using Shards=std::array<std::vector<T>,bins>;
 
 // Route by ID before reading payloads. Chunk boundaries always follow a physical LF.
-Shards<View> route(Input& input,const fs::path& dir) {
+std::array<std::vector<View>,id_bins> route(Input& input,const fs::path& dir) {
     std::vector<View> chunks;
     for (auto& path:files(dir)) {
         View s=body(input.open(path));
@@ -228,15 +261,15 @@ Shards<View> route(Input& input,const fs::path& dir) {
         }
         if (!s.empty()) chunks.push_back(s);
     }
-    Shards<View> result;
-    std::array<std::mutex,bins> locks;
+    std::array<std::vector<View>,id_bins> result;
+    std::array<std::mutex,id_bins> locks;
     parallel(chunks.size(),[&](size_t i){
-        Shards<View> local;
+        std::array<std::vector<View>,id_bins> local;
         lines(chunks[i],[&](View s){
             View id=s.substr(0,s.find(','));
-            if (decode(id) && !id.empty()) local[bucket(id)].push_back(s);
+            if (decode(id) && !id.empty()) local[std::hash<View>{}(id)%id_bins].push_back(s);
         });
-        for (size_t b=0;b<bins;++b) {
+        for (size_t b=0;b<id_bins;++b) {
             std::lock_guard lock(locks[b]);
             result[b].insert(result[b].end(),local[b].begin(),local[b].end());
         }
@@ -249,27 +282,33 @@ template<bool events> auto clean(Input& input,const fs::path& dir,const Context&
     auto raw=route(input,dir);
     Shards<Row> result;
     std::array<std::mutex,bins> locks;
-    parallel(bins,[&](size_t b){
+    parallel(id_bins,[&](size_t b){
         Shards<Row> local;
         // Open addressing, with full byte equality on collisions. Invalid earliest
         // events still occupy their slot and can replace a valid later event.
         size_t capacity=1;
         while (capacity<raw[b].size()*1.5) capacity*=2;
-        std::vector<int> slots(capacity,-1);
+        struct Slot { int index=-1; uint32_t tag=0; };
+        std::vector<Slot> slots(capacity);
         std::vector<std::conditional_t<events,Winner,View>> winners;
         winners.reserve(raw[b].size());
         for (View line:raw[b]) {
             std::array<View,events?7:4> a;
             if (!fields(line,a)) continue;
-            size_t pos=(std::hash<View>{}(a[0])/bins)&(capacity-1);
-            while (slots[pos]>=0) {
-                View existing;
-                if constexpr (events) existing=winners[slots[pos]].id;
-                else existing=winners[slots[pos]];
-                if (existing==a[0]) break;
+            const auto hash=std::hash<View>{}(a[0]);
+            const uint32_t tag=hash>>32;
+            size_t pos=(hash/id_bins)&(capacity-1);
+            while (slots[pos].index>=0) {
+                if (slots[pos].tag==tag) {
+                    View existing;
+                    if constexpr (events) existing=winners[slots[pos].index].id;
+                    else existing=winners[slots[pos].index];
+                    if (existing==a[0]) break;
+                }
                 pos=(pos+1)&(capacity-1);
             }
-            int& slot=slots[pos];
+            slots[pos].tag=tag;
+            int& slot=slots[pos].index;
             if constexpr (events) {
                 Time ingest=stamp(a[3]);
                 if (slot>=0 && winners[slot].ingest<=ingest) continue;
