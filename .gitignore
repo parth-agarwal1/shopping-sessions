@@ -1,0 +1,12 @@
+/starter-*/
+/generator/
+/dev-answer/
+/dev/
+/out/
+/build-local/
+/bench*/
+*.parquet
+__pycache__/
+/.aws/
+/.codex/
+/.agents/
