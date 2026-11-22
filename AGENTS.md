@@ -1,6 +1,6 @@
 # Shopping Sessions handoff
 
-Read rules.md first. It is authoritative. Use the Polars starter's independent checker. The runtime uses native C++ for parsing, union-find, deduplication, sessions and attribution, then Polars for typed Parquet output. C++ permits local testing without a Rust toolchain. Rust 1.85+ is required for the official generator only.
+Read rules.md first. It is authoritative. Use the Polars starter's independent checker. The runtime is one static C++ executable. Polars is used by the independent checker. Rust 1.85+ is required for the official generator only.
 
 Preserve LF-only records, byte-exact IDs, malformed-row rejection before global earliest-ingest deduplication, link-only minimum IDs, strict session gaps and inclusive attribution boundaries. Keep the entire session on its UTC start day. Count assists once per distinct campaign per session. Keep all counters in 64 bits.
 
@@ -17,3 +17,11 @@ Local native-only smoke benchmark on an i5-13450HX, CPUs 0–7, fresh processes 
 Rust was installed locally to build the official generator. Python 3.12 and Polars 1.35.2 were installed to run the official Parquet checker directly against the same native binary and writer used in the image. All 36 fixture files and both seed-1 dev answer tables matched. This host has no Docker daemon. The original commit scored 6.4951 s in practice, as reported by the user.
 
 The performance branch uses a contiguous linked-ID table, hash tags to avoid unnecessary full ID comparisons on collisions, and 32 deduplication partitions while retaining 128 person partitions. The full local pipeline on official generator seed 2 (20M events and 5M clicks, CPUs 0–7, cached input) took 5.22, 5.20, and 5.25 s, compared with 6.38 s in the original local profile. Both versions' Parquet results matched exactly on seed 2. The optimized version also passed all 36 official Parquet fixtures, both dev tables, and the independent randomized checks. Reparse-after-routing remains expensive, but the trial that parsed before routing used more memory without a repeatable speedup. The date cache and vectorized CSV experiments did not show a repeatable gain over the simpler changes. Re-profile on fresh scorer containers before tuning further.
+
+## Packed native version
+
+The current candidate builds a single static C++ binary with a direct Parquet writer. On CPUs with AVX2, BMI, BMI2 and POPCNT, it parses CSV with 64-byte delimiter masks, interns short IDs in a reversible order-preserving representation, resolves links with union-find, and uses 32-byte event candidates and 16-byte event survivors. It groups events by person before sorting inside each person's range. Unsupported CPUs and inputs use the original exact engine. Both implementations write the same Parquet schema. No competitor code was imported. The README links the research references.
+
+Use `make fixtures-native` for the direct writer and repeat it with `SHOP_GENERIC=1` for the general path. `scripts/native_run.sh dev out` exercises the no-argument container entry point locally. Compare using `make check-dev` with the published answers. Run the Docker fixture target on a Docker host before drawing image conclusions. Maintain exact dev and generated-data comparisons before using a practice slot.
+
+With eight pinned host CPUs and a warm page cache, the static executable took 1.89, 1.90, and 2.00 s on official generator seed 2 (20M events and 5M clicks). Seed 3 (60M events and 15M clicks) took 5.73 s at 7,416,524 KiB peak process RSS. Both output tables matched the prior verified implementation at each scale. The static binary passed 36/36 official fixtures and checked exactly against the seed-1 dev answers. The original CSV writer comparison path is available only via the two-argument local CLI. These timings exclude Docker startup and have not been measured on the official scorer.

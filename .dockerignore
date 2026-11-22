@@ -1,6 +1,6 @@
 **
 !src/
 !src/shop.cpp
-!src/write.py
-!run.sh
+!src/packed.hpp
+!src/parquet.hpp
 !Dockerfile

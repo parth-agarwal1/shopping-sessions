@@ -34,7 +34,7 @@ check-dev:
 .PHONY: native
 native: build-local/shop
 
-build-local/shop: src/shop.cpp
+build-local/shop: src/shop.cpp src/packed.hpp src/parquet.hpp
 	mkdir -p build-local
 	$(CXX) -O3 -DNDEBUG -std=c++17 -pthread -Wall -Wextra $< -o $@
 
@@ -42,3 +42,7 @@ build-local/shop: src/shop.cpp
 check-native: native
 	python3 scripts/check_native.py $(FIXTURES)
 	python3 scripts/check_random.py
+
+.PHONY: fixtures-native
+fixtures-native: native
+	python3 scripts/run_fixtures.py $(FIXTURES) -- scripts/native_run.sh
