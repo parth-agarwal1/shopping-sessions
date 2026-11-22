@@ -500,7 +500,7 @@ template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,con
     };
 
     auto person_output=[&](View user,const auto& events,size_t i,size_t event_end,
-                           const std::vector<C>& clicks,size_t left,size_t click_end) {
+                           const auto& clicks,size_t left,size_t click_end) {
         size_t right=left;
         for (int campaign:active) active_counts[campaign]=0;
         active.clear();
@@ -564,50 +564,48 @@ template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,con
         }
     };
 
-    std::vector<packed::Key> compact_names;
     if constexpr (compact) {
-        compact_names=packed::group(e,c);
+        auto grouped=packed::group(e,c);
+        size_t start=0, click_start=0;
+        for (size_t p=0;p<grouped.names.size();++p) {
+            const auto end=grouped.event_ends[p], click_end=grouped.click_ends[p];
+            std::array<char,9> text;
+            const auto user=packed::name(grouped.names[p],text);
+            if (end-start>=packed::cell_threshold) {
+                cells.build(grouped.events.data()+start,grouped.events.data()+end,size_t(ctx.end-base));
+                person_output(user,cells.ordered,0,cells.ordered.size(),grouped.clicks,click_start,click_end);
+            } else {
+                person_output(user,grouped.events,start,end,grouped.clicks,click_start,click_end);
+            }
+            start=end;
+            click_start=click_end;
+        }
     } else {
         // Canonicalize backing addresses so even arbitrary IDs sort as one word.
         std::unordered_set<View> names;
         for (auto& row:e) row.user=*names.insert(row.user).first;
         for (auto& row:c) row.user=*names.insert(row.user).first;
-    }
-    auto key_of=[](const auto& row) {
-        if constexpr (compact) return row.user;
-        else return row.user.data();
-    };
-    auto before=std::less<decltype(key_of(std::declval<E&>()))>{};
-    if constexpr (!compact) {
+        auto before=std::less<const char*>{};
         std::sort(e.begin(),e.end(),[&](const E& a,const E& b){
-            if (key_of(a)!=key_of(b)) return before(key_of(a),key_of(b));
+            if (a.user.data()!=b.user.data()) return before(a.user.data(),b.user.data());
             return a.ts<b.ts;
         });
         std::sort(c.begin(),c.end(),[&](const C& a,const C& b){
-            if (key_of(a)!=key_of(b)) return before(key_of(a),key_of(b));
+            if (a.user.data()!=b.user.data()) return before(a.user.data(),b.user.data());
             return a.ts!=b.ts?a.ts<b.ts:a.id>b.id;
         });
-    }
-    size_t click_start=0;
-    for (size_t start=0;start<e.size();) {
-        const auto key=key_of(e[start]);
-        size_t end=start+1;
-        while (end<e.size() && key_of(e[end])==key) ++end;
-        while (click_start<c.size() && before(key_of(c[click_start]),key)) ++click_start;
-        size_t click_end=click_start;
-        while (click_end<c.size() && key_of(c[click_end])==key) ++click_end;
-        [[maybe_unused]] std::array<char,9> text;
-        View user;
-        if constexpr (compact) user=packed::name(compact_names[key],text);
-        else user=e[start].user;
-        if constexpr (compact) {
-            if (end-start>=packed::cell_threshold) {
-                cells.build(e.data()+start,e.data()+end,size_t(ctx.end-base));
-                person_output(user,cells.ordered,0,cells.ordered.size(),c,click_start,click_end);
-            } else person_output(user,e,start,end,c,click_start,click_end);
-        } else person_output(user,e,start,end,c,click_start,click_end);
-        start=end;
-        click_start=click_end;
+        size_t click_start=0;
+        for (size_t start=0;start<e.size();) {
+            const auto key=e[start].user.data();
+            size_t end=start+1;
+            while (end<e.size() && e[end].user.data()==key) ++end;
+            while (click_start<c.size() && before(c[click_start].user.data(),key)) ++click_start;
+            size_t click_end=click_start;
+            while (click_end<c.size() && c[click_end].user.data()==key) ++click_end;
+            person_output(e[start].user,e,start,end,c,click_start,click_end);
+            start=end;
+            click_start=click_end;
+        }
     }
 }
 int main(int argc,char** argv) try {

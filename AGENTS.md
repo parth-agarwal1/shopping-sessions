@@ -93,3 +93,11 @@ A first-field duplicate prepass with thread-private seen and repeated bitmaps pr
 Use make check-native for the independent oracle and 127/128/129-event threshold regression, and run all 36 Parquet fixtures with both default and SHOP_GENERIC=1. The threshold test includes quoted duplicates in separate files, an invalid earliest copy with a different shopper, and gaps of 1,800,000 and 1,800,001 ms.
 
 The final warm-cache comparison rotated three binaries on logical CPUs 0–7. Median native wall time at 20M (six runs each) was 1.18 s for the preceding release, 1.15 s with time cells, and 1.155 s with cells and the partition-local filter. At 60M (three runs each) the medians were 3.67 s, 3.67 s and 3.76 s. Peak release RSS at 60M was 7,616,804 KiB. Both release Parquet tables matched the golden 1M output and the verified 20M and 60M outputs exactly. Docker and official scorer timings remain unverified.
+
+## v5 event winner and shopper payload experiments
+
+A single shared earliest-ingest index stored tagged references to stable parser-local record pages. It routed surviving events about 70 ms faster at 20M, but its random atomic probes increased median native time from 1.16 s to 1.39 s at 20M and from 3.60 s to 4.45 s at 60M. Huge pages and a variant that partitioned only 8-byte record references also lost at 60M. Keep exact partitioned deduplication for the shipped path. The original 72 ms difference between checksum decoding and packing measured only the input stage under diagnostic conditions.
+
+After indexing shoppers, the grouping scatter now writes 8-byte event payloads and 16-byte click payloads. The shopper key and exclusive range ends live once per shopper. Sorting and attribution use these ranges directly. Click payloads retain the complete tie-breaking ID. The changes apply only after the byte-exact identity and winner checks.
+
+Warm-cache alternating native comparisons on eight logical CPUs gave medians of 1.15 to 1.13 s at 20M (five runs each) and 3.685 to 3.65 s at 60M (four runs each). Both Parquet tables matched at 1M, 20M and 60M. Recheck improvements against the current scorer when available. Local runtimes do not establish a sub-0.4 s result.

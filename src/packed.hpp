@@ -283,8 +283,6 @@ inline bool Names::fill(const std::vector<View>& chunks,int limit) {
 struct Evt {
     Key user;
     uint32_t ts, value;
-    int price() const { return value & 0xffffff; }
-    int cat() const { return value >> 24; }
 };
 struct Ad { Key user, id; uint32_t ts; int campaign; };
 // Ingest seconds are relative to the window base.
@@ -295,6 +293,21 @@ static_assert(sizeof(Evt)==16 && sizeof(Copy)==32 && sizeof(Ad)==24);
 #define SHOP_CELL_THRESHOLD 128
 #endif
 constexpr size_t cell_threshold=SHOP_CELL_THRESHOLD;
+
+struct EventPayload {
+    uint32_t ts,value;
+    int price() const { return value&0xffffff; }
+    int cat() const { return value>>24; }
+};
+struct ClickPayload { Key id; uint32_t ts; int campaign; };
+// Shopper keys appear once per range in the grouped layout.
+static_assert(sizeof(EventPayload)==8 && sizeof(ClickPayload)==16);
+struct GroupedShopper {
+    std::vector<Key> names;
+    std::vector<size_t> event_ends, click_ends;
+    std::vector<EventPayload> events;
+    std::vector<ClickPayload> clicks;
+};
 
 // Events inside one half-hour cell necessarily belong to one session.
 // Across cells the actual first and last timestamps decide the gap.
@@ -308,7 +321,7 @@ struct TimeCells {
     std::vector<uint64_t> present;
     std::vector<Purchase> purchases;
 
-    void build(const Evt* first,const Evt* end,size_t span) {
+    void build(const EventPayload* first,const EventPayload* end,size_t span) {
         if (bins.empty()) {
             bins.resize((span-1)/gap+1);
             present.resize((bins.size()+63)/64);
@@ -345,11 +358,13 @@ struct TimeCells {
 
 // Assign local indices, counting-sort rows into one range per person, then
 // sort only within those ranges. A partition's index fits in a small table.
-inline std::vector<Key> group(std::vector<Evt>& events, std::vector<Ad>& clicks) {
+inline GroupedShopper group(std::vector<Evt>& events, std::vector<Ad>& clicks) {
     struct Entry { Key key=0; uint32_t index=0; };
     std::vector<Entry> index(1024);
-    std::vector<Key> names;
-    std::vector<size_t> event_counts, click_counts;
+    GroupedShopper grouped;
+    auto& names=grouped.names;
+    auto& event_counts=grouped.event_ends;
+    auto& click_counts=grouped.click_ends;
     auto find=[](const std::vector<Entry>& index, Key key) {
         auto mask=index.size()-1;
         size_t at=(hash(key)>>8)&mask;
@@ -389,33 +404,37 @@ inline std::vector<Key> group(std::vector<Evt>& events, std::vector<Ad>& clicks)
             row.user=UINT64_MAX;
         }
     }
-    auto scatter=[](auto& rows,const std::vector<size_t>& counts,size_t size,auto sort_range) {
-        auto cursors=counts;
+    auto scatter=[](auto& rows,auto& payloads,std::vector<size_t>& cursors,
+                    size_t size,auto payload_of,auto sort_range) {
         size_t offset=0;
         for (auto& count:cursors) {
             auto next=offset+count;
             count=offset;
             offset=next;
         }
-        std::decay_t<decltype(rows)> grouped(size);
-        for (auto row:rows) if (row.user!=UINT64_MAX) grouped[cursors[row.user]++]=row;
-        rows.swap(grouped);
+        payloads.resize(size);
+        for (auto row:rows) if (row.user!=UINT64_MAX) payloads[cursors[row.user]++]=payload_of(row);
+        std::decay_t<decltype(rows)>().swap(rows);
         size_t start=0;
         for (auto end:cursors) {
-            if (end-start>1) sort_range(rows.data()+start,rows.data()+end);
+            if (end-start>1) sort_range(payloads.data()+start,payloads.data()+end);
             start=end;
         }
     };
-    scatter(events,event_counts,events.size(),[](Evt* first,Evt* end){
-        if (size_t(end-first)<cell_threshold)
-            std::sort(first,end,[](const Evt& a,const Evt& b){ return a.ts<b.ts; });
-    });
-    scatter(clicks,click_counts,surviving_clicks,[](Ad* first,Ad* end){
-        std::sort(first,end,[](const Ad& a,const Ad& b){
-            return a.ts!=b.ts ? a.ts<b.ts : less(b.id,a.id);
+    scatter(events,grouped.events,event_counts,events.size(),
+        [](const Evt& row){ return EventPayload{row.ts,row.value}; },
+        [](EventPayload* first,EventPayload* end) {
+            if (size_t(end-first)<cell_threshold)
+                std::sort(first,end,[](const auto& a,const auto& b){ return a.ts<b.ts; });
         });
-    });
-    return names;
+    scatter(clicks,grouped.clicks,click_counts,surviving_clicks,
+        [](const Ad& row){ return ClickPayload{row.id,row.ts,row.campaign}; },
+        [](ClickPayload* first,ClickPayload* end) {
+            std::sort(first,end,[](const auto& a,const auto& b){
+                return a.ts!=b.ts ? a.ts<b.ts : less(b.id,a.id);
+            });
+        });
+    return grouped;
 }
 
 struct Clean {
