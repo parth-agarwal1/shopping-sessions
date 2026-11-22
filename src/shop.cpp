@@ -112,6 +112,15 @@ int digits(View s,size_t pos,int n) {
 Time decimal(View s,Time limit) {
     if (s.empty()) return invalid;
     Time v=0;
+    // Up to 18 decimal digits fit in an i64 regardless of their value.
+    if (s.size()<=18) {
+        for (char c:s) {
+            unsigned d=unsigned(c-'0');
+            if (d>9) return invalid;
+            v=v*10+d;
+        }
+        return v<=limit ? v : invalid;
+    }
     for (char c:s) {
         unsigned d=unsigned(c-'0');
         if (d>9 || v>(limit-int(d))/10) return invalid;
@@ -119,13 +128,9 @@ Time decimal(View s,Time limit) {
     }
     return v;
 }
-Time stamp(View s) {
-    if ((s.size()!=20 && s.size()!=25) || s[4]!='-')
-        return decimal(s,std::numeric_limits<Time>::max());
-    if (s[7]!='-' || s[10]!='T' || s[13]!=':' || s[16]!=':') return invalid;
+Time date_epoch(View s) {
     int y=digits(s,0,4), m=digits(s,5,2), d=digits(s,8,2);
-    int h=digits(s,11,2), min=digits(s,14,2), sec=digits(s,17,2);
-    if (y<0 || m<1 || m>12 || d<1 || h<0 || h>=24 || min<0 || min>=60 || sec<0 || sec>=60) return invalid;
+    if (y<0 || m<1 || m>12 || d<1) return invalid;
     constexpr int lengths[]={31,28,31,30,31,30,31,31,30,31,30,31};
     bool leap=y%4==0 && (y%100!=0 || y%400==0);
     if (d>lengths[m-1]+(m==2 && leap)) return invalid;
@@ -133,7 +138,24 @@ Time stamp(View s) {
     y-=(m<=2);
     int era=(y>=0?y:y-399)/400, year=y-era*400;
     int ordinal=(153*(m+(m>2?-3:9))+2)/5+d-1;
-    Time epoch_day=era*146097+year*365+year/4-year/100+ordinal-719468;
+    return (era*146097+year*365+year/4-year/100+ordinal-719468)*day_ms;
+}
+Time stamp(View s) {
+    if ((s.size()!=20 && s.size()!=25) || s[4]!='-')
+        return decimal(s,std::numeric_limits<Time>::max());
+    if (s[7]!='-' || s[10]!='T' || s[13]!=':' || s[16]!=':') return invalid;
+    int h=digits(s,11,2), min=digits(s,14,2), sec=digits(s,17,2);
+    if (h<0 || h>=24 || min<0 || min>=60 || sec<0 || sec>=60) return invalid;
+    // Cache checked dates per thread. A hit requires the entire date prefix.
+    struct Date { uint64_t front=0; uint16_t tail=0; Time epoch=invalid; };
+    static thread_local std::array<Date,128> days;
+    uint64_t front;
+    uint16_t tail;
+    std::memcpy(&front,s.data(),sizeof front);
+    std::memcpy(&tail,s.data()+sizeof front,sizeof tail);
+    auto& date=days[(tail+(tail>>5)+uint8_t(s[6])*17+uint8_t(s[3])*39)%days.size()];
+    if (date.front!=front || date.tail!=tail) date={front,tail,date_epoch(s)};
+    if (date.epoch==invalid) return invalid;
     int offset=0;
     if (s.size()==20) { if (s[19]!='Z') return invalid; }
     else {
@@ -141,7 +163,7 @@ Time stamp(View s) {
         if ((s[19]!='+' && s[19]!='-') || s[22]!=':' || oh<0 || oh>=24 || om<0 || om>=60) return invalid;
         offset=(s[19]=='+'?1:-1)*(oh*60+om);
     }
-    return epoch_day*day_ms+
+    return date.epoch+
         ((h*60+min-offset)*60+sec)*1000LL;
 }
 
@@ -441,7 +463,9 @@ template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,con
     size_t i=0, cursor=0;
     std::vector<int64_t> by_category(ctx.categories.size());
     std::vector<int> touched;
-    std::unordered_map<int,int> active;
+    std::vector<int> active;
+    std::vector<int> active_counts(ctx.campaign.size());
+    std::vector<size_t> active_index(ctx.campaign.size());
     while (i<e.size()) {
         auto key=key_of(e[i]);
         [[maybe_unused]] std::array<char,9> text;
@@ -450,20 +474,31 @@ template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,con
         else user=e[i].user;
         while (cursor<c.size() && before(key_of(c[cursor]),key)) ++cursor;
         size_t right=cursor,left=cursor;
+        for (int campaign:active) active_counts[campaign]=0;
         active.clear();
         while (i<e.size() && key_of(e[i])==key) {
             int day=utc_day(time_of(e[i]));
             int64_t sessions=0,count=0,revenue=0;
             do {
                 Time start=time_of(e[i]);
-                while (right<c.size() && key_of(c[right])==key && time_of(c[right])<=start)
-                    ++active[c[right++].campaign];
+                while (right<c.size() && key_of(c[right])==key && time_of(c[right])<=start) {
+                    const int campaign=c[right++].campaign;
+                    if (active_counts[campaign]++==0) {
+                        active_index[campaign]=active.size();
+                        active.push_back(campaign);
+                    }
+                }
                 while (left<right && time_of(c[left])<start-week) {
-                    auto it=active.find(c[left++].campaign);
-                    if (--it->second==0) active.erase(it);
+                    const int campaign=c[left++].campaign;
+                    if (--active_counts[campaign]==0) {
+                        const size_t at=active_index[campaign];
+                        active[at]=active.back();
+                        active_index[active[at]]=at;
+                        active.pop_back();
+                    }
                 }
                 int winner=left==right?0:c[right-1].campaign;
-                for (auto [campaign,n]:active) ++totals[campaign_day(campaign,day)].assists;
+                for (int campaign:active) ++totals[campaign_day(campaign,day)].assists;
                 int64_t session_revenue=0;
                 do {
                     const E& event=e[i++];
