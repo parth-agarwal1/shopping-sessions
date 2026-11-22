@@ -8,6 +8,8 @@ When compatible event IDs are detected, the engine finds an inverse mapping from
 
 After deduplication, the engine checks canonical shoppers within each shopper partition. A complete run in timestamp order is sessionized in place. Unordered single runs are sorted in place, and only shoppers with multiple runs are copied into a new grouping buffer. Set `SHOP_REGROUP_ALL=1` to compare against grouping every event. `SHOP_PROFILE=1` reports coverage and stage timings.
 
+The CSV scanner validates whole-field quotes from the row's separator and quote masks before extracting fields. Rows with an empty first field, long lines and chunk tails use the general decoder as applicable. `SHOP_LEGACY_CSV=1` switches off quote-mask pairing for A/B checks.
+
 ```sh
 make native
 make check-native

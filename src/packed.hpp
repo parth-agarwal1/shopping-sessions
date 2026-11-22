@@ -68,9 +68,9 @@ inline Masks classify64(const char* data) {
     return {mask(','),mask('"'),mask('\n')};
 }
 
-template<size_t N, class F>
+template<bool paired_quotes, size_t N, class F>
 __attribute__((target("avx2,popcnt,bmi,bmi2")))
-void rows(View chunk, F consume) {
+void scan_rows(View chunk, F consume) {
     const char* at=chunk.data();
     const char* end=at+chunk.size();
     while (end-at>=128) {
@@ -91,10 +91,54 @@ void rows(View chunk, F consume) {
         size_t last=stop/64;
         uint64_t keep=(1ULL<<(stop%64))-1;
         commas[last]&=keep;
-        unsigned quotes=last ? __builtin_popcountll(lo.quote)+__builtin_popcountll(hi.quote&keep)
-                             : __builtin_popcountll(lo.quote&keep);
+        uint64_t quote_lo=lo.quote&(last ? UINT64_MAX : keep);
+        uint64_t quote_hi=hi.quote&(last ? keep : 0);
+        unsigned quotes=__builtin_popcountll(quote_lo)+__builtin_popcountll(quote_hi);
 
         if (__builtin_popcountll(commas[0])+__builtin_popcountll(commas[1])==N-1) {
+            if constexpr (paired_quotes) {
+                // An empty first field would drop its closing-position bit at
+                // position -1. Let the general decoder handle that layout.
+                if (!(commas[0]&1)) {
+                    unsigned quoted=0;
+                    if (quote_lo || quote_hi) {
+                        uint64_t start_lo=(commas[0]<<1)|1;
+                        uint64_t start_hi=(commas[1]<<1)|(commas[0]>>63);
+                        uint64_t stop_lo=commas[0] | (last==0 ? 1ULL<<(stop%64) : 0);
+                        uint64_t stop_hi=commas[1] | (last==1 ? 1ULL<<(stop%64) : 0);
+                        uint64_t end_lo=(stop_lo>>1)|(stop_hi<<63);
+                        uint64_t end_hi=stop_hi>>1;
+                        // Reject interior quotes and fields with a single quote.
+                        bool edge_only=
+                            !(quote_lo&(~(start_lo|end_lo)|(start_lo&end_lo))) &&
+                            !(quote_hi&(~(start_hi|end_hi)|(start_hi&end_hi)));
+                        quoted=_pext_u64(quote_lo,start_lo) |
+                               (_pext_u64(quote_hi,start_hi)<<__builtin_popcountll(start_lo));
+                        unsigned closed=_pext_u64(quote_lo,end_lo) |
+                            (_pext_u64(quote_hi,end_hi)<<__builtin_popcountll(end_lo));
+                        if (!edge_only || quoted!=closed) {
+                            at+=stop+1;
+                            continue;
+                        }
+                    }
+                    std::array<View,N> f;
+                    size_t start=0, part=0;
+                    for (size_t col=0;col<N;++col) {
+                        size_t finish=stop;
+                        if (col+1<N) {
+                            if (!commas[part]) ++part;
+                            finish=64*part+__builtin_ctzll(commas[part]);
+                            commas[part]&=commas[part]-1;
+                        }
+                        unsigned q=(quoted>>col)&1;
+                        f[col]={at+start+q,finish-start-2*q};
+                        start=finish+1;
+                    }
+                    consume(f);
+                    at+=stop+1;
+                    continue;
+                }
+            }
             std::array<View,N> f;
             size_t start=0, part=0;
             for (size_t col=0;col<N;++col) {
@@ -118,6 +162,14 @@ void rows(View chunk, F consume) {
         std::array<View,N> f;
         if (fields(line,f)) consume(f);
     });
+}
+
+template<size_t N, class F>
+void rows(View chunk,F consume) {
+    if constexpr (N>=4) {
+        if (!getenv("SHOP_LEGACY_CSV")) return scan_rows<true,N>(chunk,consume);
+    }
+    scan_rows<false,N>(chunk,consume);
 }
 
 inline bool Names::fill(const std::vector<View>& chunks) {
