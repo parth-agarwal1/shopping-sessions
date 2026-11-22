@@ -1,6 +1,6 @@
 # Shopping Sessions
 
-Exact Shopping Sessions pipeline for the Builders Buildathon. The image runs one statically linked C++ binary as uid 1000. The binary reads `DATA_DIR` (default `/data`), writes both Parquet tables under `OUTPUT_DIR` (default `/output`), and uses up to `NCPU` workers (default 8).
+Exact Shopping Sessions pipeline for the Builders Buildathon. The image runs one statically linked C++ binary as uid 1000. The binary reads `DATA_DIR` (default `/data`), writes both Parquet tables under `OUTPUT_DIR` (default `/output`), and uses `NCPU` foreground workers (default 8). Identity links can be built on a small background team while event rows are parsed.
 
 On supported x86-64 CPUs, an AVX2 scanner parses CSV into 32-byte event candidates. Short ASCII IDs have a reversible encoding that preserves byte order. Union-find applies the supplied links, deduplication retains the earliest ingest even if its event is invalid, and the remaining records are grouped by shopper before sorting by time. A native Parquet writer emits the two tables directly. Inputs outside the compact representation use the general engine. `SHOP_GENERIC=1` selects it explicitly.
 
@@ -9,6 +9,8 @@ When compatible event IDs are detected, the engine finds an inverse mapping from
 After deduplication, the engine checks canonical shoppers within each shopper partition. A complete run in timestamp order is sessionized in place. Unordered single runs are sorted in place, and only shoppers with multiple runs are copied into a new grouping buffer. Set `SHOP_REGROUP_ALL=1` to compare against grouping every event. `SHOP_PROFILE=1` reports coverage and stage timings.
 
 The CSV scanner validates whole-field quotes from the row's separator and quote masks before extracting fields. Rows with an empty first field, long lines and chunk tails use the general decoder as applicable. `SHOP_LEGACY_CSV=1` switches off quote-mask pairing for A/B checks.
+
+The dense path hands off whole survivor buffers to the shopper stage. Workers consume verified runs directly, reuse their campaign counters and Parquet buffers, and start the largest shopper shards first. Campaign totals use a bounded array when the day and campaign range fits, with a sparse map for larger ranges. Use a fresh output directory for each run.
 
 ```sh
 make native

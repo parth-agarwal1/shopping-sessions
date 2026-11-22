@@ -45,10 +45,16 @@ inline uint64_t hash(Key key) {
 struct Names {
     struct Entry { Key id=0, person=0; };
     std::vector<Entry> entries;
-    bool fill(const std::vector<View>& chunks);
+    std::vector<uint64_t> aliases;
+    bool fill(const std::vector<View>& chunks,int limit);
     size_t home(Key id) const { return hash(id)&(entries.size()-1); }
     Key resolve(Key id) const {
-        size_t i=home(id);
+        const auto h=hash(id);
+        if (!aliases.empty()) {
+            const size_t bit=h&(aliases.size()*64-1);
+            if (!(aliases[bit/64]&(1ULL<<(bit%64)))) return id;
+        }
+        size_t i=h&(entries.size()-1);
         while (entries[i].id && entries[i].id!=id) i=(i+1)&(entries.size()-1);
         return entries[i].id ? entries[i].person : id;
     }
@@ -172,10 +178,10 @@ void rows(View chunk,F consume) {
     scan_rows<false,N>(chunk,consume);
 }
 
-inline bool Names::fill(const std::vector<View>& chunks) {
+inline bool Names::fill(const std::vector<View>& chunks,int limit) {
     std::vector<std::vector<std::pair<Key,Key>>> shards(chunks.size());
     std::atomic<bool> incompatible{false};
-    parallel(chunks.size(),[&](size_t chunk) {
+    parallel_workers(chunks.size(),limit,[&](size_t chunk,size_t) {
         auto& edges=shards[chunk];
         rows<2>(chunks[chunk],[&](const auto& f) {
             if (f[0].empty() || f[1].empty()) return;
@@ -222,7 +228,15 @@ inline bool Names::fill(const std::vector<View>& chunks) {
         nodes[ar].size+=nodes[br].size;
         nodes[ar].name=std::min(nodes[ar].name,nodes[br].name);
     }
-    for (auto& entry:entries) if (entry.id) entry.person=nodes[root(entry.person)].name;
+    if (!getenv("SHOP_NO_ALIAS_FILTER") && entries.size()>=1024)
+        aliases.resize(std::min(entries.size()/8,size_t(262144)));
+    for (auto& entry:entries) if (entry.id) {
+        entry.person=nodes[root(entry.person)].name;
+        if (!aliases.empty() && entry.id!=entry.person) {
+            const size_t bit=hash(entry.id)&(aliases.size()*64-1);
+            aliases[bit/64]|=1ULL<<(bit%64);
+        }
+    }
     return true;
 }
 
@@ -310,10 +324,18 @@ inline std::vector<Key> group(std::vector<Evt>& events, std::vector<Ad>& clicks)
 struct RunStats {
     size_t ordered=0, sorted_in_place=0, regrouped=0;
 };
+using EventBuffers=std::vector<std::vector<Evt>>;
+struct EventSpan {
+    Evt* first;
+    size_t length;
+    Evt* begin() const { return first; }
+    size_t size() const { return length; }
+    Evt& operator[](size_t i) const { return first[i]; }
+};
 struct Verified {
     struct Person {
         Key name;
-        size_t first, count, click_end;
+        size_t block, first, count, click_end;
         bool ordered, split=false;
     };
     std::vector<Person> people;
@@ -325,11 +347,10 @@ struct Verified {
 // Each person hash shard receives every surviving event for its people,
 // including the non-dense ID overflow. Checking all runs in that shard
 // proves whether a contiguous range contains the whole person's history.
-inline Verified verify_runs(std::vector<Evt>& events, std::vector<Ad>& clicks) {
+inline Verified verify_runs(const std::vector<EventSpan>& spans, std::vector<Ad>& clicks) {
     Verified result;
-    if (events.empty()) return result;
     struct Entry { Key key=0; uint32_t person=0; };
-    struct Run { size_t start, count; uint32_t person; };
+    struct Run { size_t block, start, count; uint32_t person; };
     std::vector<Entry> index(1024);
     std::vector<Run> runs;
     auto slot=[](const std::vector<Entry>& table, Key key) {
@@ -338,33 +359,37 @@ inline Verified verify_runs(std::vector<Evt>& events, std::vector<Ad>& clicks) {
         while (table[at].key && table[at].key!=key) at=(at+1)&mask;
         return at;
     };
-    for (size_t start=0; start<events.size();) {
-        const Key name=events[start].user;
-        size_t end=start+1;
-        bool ordered=true;
-        while (end<events.size() && events[end].user==name) {
-            ordered &= events[end-1].ts<=events[end].ts;
-            ++end;
+    for (size_t block=0;block<spans.size();++block) {
+        const auto events=spans[block];
+        for (size_t start=0; start<events.size();) {
+            const Key name=events[start].user;
+            size_t end=start+1;
+            bool ordered=true;
+            while (end<events.size() && events[end].user==name) {
+                ordered &= events[end-1].ts<=events[end].ts;
+                ++end;
+            }
+            if (result.people.size()*4>=index.size()*3) {
+                std::vector<Entry> bigger(index.size()*2);
+                for (auto entry:index) if (entry.key) bigger[slot(bigger,entry.key)]=entry;
+                index.swap(bigger);
+            }
+            const size_t count=end-start;
+            auto& entry=index[slot(index,name)];
+            if (!entry.key) {
+                entry={name,uint32_t(result.people.size())};
+                result.people.push_back({name,block,start,count,0,ordered});
+            } else {
+                auto& person=result.people[entry.person];
+                if (!person.split) runs.push_back({person.block,person.first,person.count,entry.person});
+                person.split=true;
+                person.count+=count;
+                runs.push_back({block,start,count,entry.person});
+            }
+            start=end;
         }
-        if (result.people.size()*4>=index.size()*3) {
-            std::vector<Entry> bigger(index.size()*2);
-            for (auto entry:index) if (entry.key) bigger[slot(bigger,entry.key)]=entry;
-            index.swap(bigger);
-        }
-        const size_t count=end-start;
-        auto& entry=index[slot(index,name)];
-        if (!entry.key) {
-            entry={name,uint32_t(result.people.size())};
-            result.people.push_back({name,start,count,0,ordered});
-        } else {
-            auto& person=result.people[entry.person];
-            if (!person.split) runs.push_back({person.first,person.count,entry.person});
-            person.split=true;
-            person.count+=count;
-            runs.push_back({start,count,entry.person});
-        }
-        start=end;
     }
+    if (result.people.empty()) return result;
 
     size_t split_rows=0;
     std::vector<size_t> write_offsets(result.people.size());
@@ -378,7 +403,7 @@ inline Verified verify_runs(std::vector<Evt>& events, std::vector<Ad>& clicks) {
     result.regrouped.resize(split_rows);
     for (const auto& run:runs) {
         auto& cursor=write_offsets[run.person];
-        std::copy_n(events.begin()+run.start,run.count,result.regrouped.begin()+cursor);
+        std::copy_n(spans[run.block].begin()+run.start,run.count,result.regrouped.begin()+cursor);
         cursor+=run.count;
     }
 
@@ -404,8 +429,8 @@ inline Verified verify_runs(std::vector<Evt>& events, std::vector<Ad>& clicks) {
     size_t click_start=0;
     for (auto& person:result.people) {
         if (person.split || !person.ordered) {
-            auto& rows=person.split ? result.regrouped : events;
-            auto first=rows.begin()+person.first;
+            auto* rows=person.split ? result.regrouped.data() : spans[person.block].begin();
+            auto first=rows+person.first;
             std::sort(first,first+person.count,[](const Evt& a,const Evt& b){ return a.ts<b.ts; });
             (person.split ? result.stats.regrouped : result.stats.sorted_in_place)+=person.count;
         } else result.stats.ordered+=person.count;
@@ -421,8 +446,9 @@ inline Verified verify_runs(std::vector<Evt>& events, std::vector<Ad>& clicks) {
 
 struct Clean {
     Time base;
-    bool dense=false;
+    bool dense=false, segmented=false;
     Shards<Evt> events;
+    std::array<EventBuffers,bins> segments;
     Shards<Ad> clicks;
 };
 
@@ -503,7 +529,9 @@ static_assert(sizeof(DenseCopy)==24);
 
 template<bool dense>
 bool read_events(const std::vector<View>& chunks,size_t input_bytes,size_t limit,Key event_key,
-                 const Names& names,const Context& ctx,Time base,Shards<Evt>& events) {
+                 const Names& names,const std::shared_future<bool>& names_ready,
+                 const Context& ctx,Time base,Shards<Evt>& events,
+                 std::array<EventBuffers,bins>* segments=nullptr) {
     const bool profile=getenv("SHOP_PROFILE")!=nullptr;
     auto last=std::chrono::steady_clock::now();
     auto lap=[&](const char* label) {
@@ -590,6 +618,7 @@ bool read_events(const std::vector<View>& chunks,size_t input_bytes,size_t limit
     });
     if (incompatible.load()) return false;
     lap("event CSV scan and packing");
+    if (!names_ready.get()) return false;
     auto dedup=[&](auto& batch) {
         using Record=typename std::decay_t<decltype(batch)>::value_type;
         constexpr bool direct=std::is_same_v<Record,DenseCopy>;
@@ -657,8 +686,11 @@ bool read_events(const std::vector<View>& chunks,size_t input_bytes,size_t limit
         std::vector<Record>().swap(batch);
         for (size_t b=0;b<bins;++b) if (!local[b].empty()) {
             std::lock_guard lock(person_locks[b]);
-            auto& dest=events[b];
-            dest.insert(dest.end(),local[b].begin(),local[b].end());
+            if (segments) (*segments)[b].push_back(std::move(local[b]));
+            else {
+                auto& dest=events[b];
+                dest.insert(dest.end(),local[b].begin(),local[b].end());
+            }
         }
     };
     parallel(partitions+dense,[&](size_t p) {
@@ -675,7 +707,14 @@ inline std::optional<Clean> read(Input& input, const fs::path& dir, const Contex
         !__builtin_cpu_supports("bmi2") || !__builtin_cpu_supports("popcnt") ||
         ctx.categories.size()>256 || ctx.end-ctx.start+week>UINT32_MAX) return {};
     Names names;
-    if (!names.fill(scan_chunks(input,dir/"links"))) return {};
+    const auto link_chunks=scan_chunks(input,dir/"links");
+    const bool serial_links=workers==1 || getenv("SHOP_SERIAL_LINKS");
+    const int link_workers=serial_links ? workers : std::min(2,workers);
+    // Parsing copies doesn't need identities. Routing the kept copies waits
+    // for the completed graph, and then sees a read-only name table.
+    auto names_ready=std::async(serial_links ? std::launch::deferred : std::launch::async,
+                                [&]{ return names.fill(link_chunks,link_workers); }).share();
+    if (serial_links && !names_ready.get()) return {};
     Clean result{};
     result.base=ctx.start-week;
     const Time base=result.base;
@@ -685,10 +724,14 @@ inline std::optional<Clean> read(Input& input, const fs::path& dir, const Contex
     const size_t limit=std::min(input_bytes/44+1,size_t(1)<<28);
     std::optional<Key> event_key;
     if (limit>=100000 && !getenv("SHOP_HASH_IDS")) event_key=infer_event_key(chunks,limit);
-    bool ready=event_key && read_events<true>(chunks,input_bytes,limit,*event_key,names,ctx,base,result.events);
+    const bool keep_blocks=!getenv("SHOP_JOIN_EVENT_BLOCKS") && !getenv("SHOP_REGROUP_ALL");
+    bool ready=event_key && read_events<true>(chunks,input_bytes,limit,*event_key,names,names_ready,ctx,base,result.events,
+                                             keep_blocks ? &result.segments : nullptr);
+    result.segmented=ready && keep_blocks;
     if (getenv("SHOP_PROFILE")) std::cerr<<"dense event table "<<(ready?"active":"inactive")<<'\n';
     result.dense=ready;
-    if (!ready && !read_events<false>(chunks,input_bytes,0,0,names,ctx,base,result.events)) return {};
+    if (!names_ready.get()) return {};
+    if (!ready && !read_events<false>(chunks,input_bytes,0,0,names,names_ready,ctx,base,result.events)) return {};
 
     std::array<std::mutex,bins> person_locks;
     std::atomic<bool> incompatible{false};

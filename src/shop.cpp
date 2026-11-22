@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -38,15 +39,15 @@ constexpr size_t id_bins = 32;
 int workers = 8;
 size_t bucket(View s) { return std::hash<View>{}(s) % bins; }
 
-template<class F> void parallel(size_t n, F fn) {
+template<class F> void parallel_workers(size_t n,int limit,F fn) {
     std::atomic<size_t> next{0};
     std::vector<std::thread> pool;
     std::exception_ptr failure;
     std::mutex failure_lock;
-    for (size_t w = 0; w < std::min<size_t>(workers,n); ++w)
-        pool.emplace_back([&]{
+    for (size_t w = 0; w < std::min<size_t>(limit,n); ++w)
+        pool.emplace_back([&,w]{
             try {
-                for (size_t i=next++; i<n; i=next++) fn(i);
+                for (size_t i=next++; i<n; i=next++) fn(i,w);
             } catch (...) {
                 next.store(n);
                 std::lock_guard lock(failure_lock);
@@ -55,6 +56,10 @@ template<class F> void parallel(size_t n, F fn) {
         });
     for (auto& thread:pool) thread.join();
     if (failure) std::rethrow_exception(failure);
+}
+
+template<class F> void parallel(size_t n,F fn) {
+    parallel_workers(n,workers,[&](size_t i,size_t){ fn(i); });
 }
 
 // All views into input files remain valid until output has been produced.
@@ -384,11 +389,40 @@ struct Totals {
         sessions+=o.sessions; purchasing+=o.purchasing; revenue+=o.revenue; assists+=o.assists;
     }
 };
-using CampaignDays=std::unordered_map<uint64_t,Totals>;
+using CampaignMap=std::unordered_map<uint64_t,Totals>;
 uint64_t campaign_day(int id,int32_t day) {
     return (uint64_t(id)<<32)|uint32_t(day);
 }
 int32_t utc_day(Time t) { return int32_t(t/day_ms-(t%day_ms<0)); }
+struct CampaignDays {
+    CampaignMap sparse;
+    std::vector<Totals> dense;
+    int32_t first_day=0;
+    size_t campaigns=0;
+    bool prepared=false;
+
+    void prepare(const Context& ctx,bool use_dense) {
+        if (prepared) return;
+        prepared=true;
+        if (!use_dense || ctx.end<=ctx.start) return;
+        first_day=utc_day(ctx.start);
+        const size_t span=int64_t(utc_day(ctx.end-1))-first_day+1;
+        campaigns=ctx.campaign.size();
+        if (campaigns<=65536/span) dense.resize(span*campaigns);
+    }
+    Totals& at(int campaign,int32_t day) {
+        if (dense.empty()) return sparse[campaign_day(campaign,day)];
+        return dense[size_t(day-first_day)*campaigns+campaign];
+    }
+    void merge(CampaignMap& out) const {
+        for (const auto& [key,totals]:sparse) out[key].add(totals);
+        for (size_t i=0;i<dense.size();++i) {
+            const auto& totals=dense[i];
+            if (totals.sessions || totals.assists)
+                out[campaign_day(i%campaigns,first_day+int32_t(i/campaigns))].add(totals);
+        }
+    }
+};
 void quoted(std::ostream& stream,View v) { stream << '"' << v << '"'; }
 struct UserParts {
     fs::path dir;
@@ -432,7 +466,8 @@ struct UserParts {
     }
 };
 template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,const Context& ctx,
-        CampaignDays& totals,UserParts& out,Time base,bool verified,packed::RunStats& stats) {
+        CampaignDays& totals,UserParts& out,Time base,bool verified,packed::RunStats& stats,
+        packed::EventBuffers* blocks) {
     constexpr bool compact=std::is_same_v<E,packed::Evt>;
     auto time_of=[base](const auto& row) { return base+Time(row.ts); };
     std::vector<int64_t> by_category(ctx.categories.size());
@@ -441,7 +476,7 @@ template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,con
     std::vector<int> active_counts(ctx.campaign.size());
     std::vector<size_t> active_index(ctx.campaign.size());
 
-    auto person_output=[&](View user,const std::vector<E>& events,size_t i,size_t event_end,
+    auto person_output=[&](View user,const auto& events,size_t i,size_t event_end,
                            const std::vector<C>& clicks,size_t left,size_t click_end) {
         size_t right=left;
         for (int campaign:active) active_counts[campaign]=0;
@@ -468,7 +503,7 @@ template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,con
                     }
                 }
                 int winner=left==right?0:clicks[right-1].campaign;
-                for (int campaign:active) ++totals[campaign_day(campaign,day)].assists;
+                for (int campaign:active) ++totals.at(campaign,day).assists;
                 int64_t session_revenue=0;
                 do {
                     const E& event=events[i++];
@@ -482,7 +517,7 @@ template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,con
                     }
                     ++count;
                 } while (i<event_end && events[i].ts-events[i-1].ts<=gap);
-                auto& t=totals[campaign_day(winner,day)];
+                auto& t=totals.at(winner,day);
                 ++t.sessions; t.revenue+=session_revenue; t.purchasing+=(session_revenue>0);
                 ++sessions; revenue+=session_revenue;
             } while (i<event_end && utc_day(time_of(events[i]))==day);
@@ -500,13 +535,20 @@ template<class E,class C> void aggregate(std::vector<E>& e,std::vector<C>& c,con
     std::vector<packed::Key> compact_names;
     if constexpr (compact) {
         if (verified) {
-            auto groups=packed::verify_runs(e,c);
+            std::vector<packed::EventSpan> spans;
+            if (blocks) {
+                spans.reserve(blocks->size());
+                for (auto& block:*blocks) spans.push_back({block.data(),block.size()});
+            } else if (!e.empty()) spans.push_back({e.data(),e.size()});
+            auto groups=packed::verify_runs(spans,c);
             stats=groups.stats;
             size_t click_start=0;
             for (const auto& person:groups.people) {
                 std::array<char,9> text;
-                person_output(packed::name(person.name,text),person.split ? groups.regrouped : e,
-                    person.first,person.first+person.count,groups.grouped_clicks,click_start,person.click_end);
+                auto span=person.split ? packed::EventSpan{groups.regrouped.data(),groups.regrouped.size()}
+                                       : spans[person.block];
+                person_output(packed::name(person.name,text),span,person.first,person.first+person.count,
+                              groups.grouped_clicks,click_start,person.click_end);
                 click_start=person.click_end;
             }
             return;
@@ -571,16 +613,40 @@ int main(int argc,char** argv) try {
         fs::create_directories(stage/"user_daily");
         fs::create_directories(stage/"campaign_daily");
     }
-    auto summarize=[&](auto& events,auto& clicks,Time base,const Context& ctx,bool verified) {
+    auto summarize=[&](auto& events,auto& clicks,Time base,const Context& ctx,bool verified,
+                       std::array<packed::EventBuffers,bins>* segments=nullptr) {
         std::array<packed::RunStats,bins> stats;
-        parallel(bins,[&](size_t b){
-            UserParts out(stage,b,direct);
-            aggregate(events[b],clicks[b],ctx,partial[b],out,base,verified,stats[b]);
-            if (out.rows) any_users.store(true,std::memory_order_relaxed);
-            out.finish();
+        const bool dense_totals=!getenv("SHOP_SPARSE_TOTALS");
+        std::array<std::unique_ptr<UserParts>,bins> writers;
+        std::array<size_t,bins> order;
+        std::iota(order.begin(),order.end(),0);
+        // Start the largest shards first, and keep one writer and totals
+        // table per worker so their buffers survive across shard boundaries.
+        std::array<size_t,bins> weights;
+        for (size_t b=0;b<bins;++b) {
+            weights[b]=events[b].size()+2*clicks[b].size();
+            if (segments) for (const auto& block:(*segments)[b]) weights[b]+=block.size();
+        }
+        std::sort(order.begin(),order.end(),[&](size_t a,size_t b){ return weights[a]>weights[b]; });
+        parallel_workers(bins,workers,[&](size_t item,size_t worker){
+            const size_t b=order[item];
+            auto blocks=segments ? &(*segments)[b] : nullptr;
+            if (events[b].empty() && (!blocks || blocks->empty())) {
+                std::decay_t<decltype(clicks[b])>().swap(clicks[b]);
+                return;
+            }
+            auto& writer=writers[worker];
+            if (!writer) writer=std::make_unique<UserParts>(stage,worker,direct);
+            auto& campaign_days=partial[worker];
+            campaign_days.prepare(ctx,dense_totals);
+            aggregate(events[b],clicks[b],ctx,campaign_days,*writer,base,verified,stats[b],blocks);
+            if (writer->rows) any_users.store(true,std::memory_order_relaxed);
+            if (blocks) packed::EventBuffers().swap(*blocks);
             std::decay_t<decltype(events[b])>().swap(events[b]);
             std::decay_t<decltype(clicks[b])>().swap(clicks[b]);
         });
+        if (any_users.load(std::memory_order_relaxed))
+            parallel(workers,[&](size_t i){ if (writers[i]) writers[i]->finish(); });
         if (verified && getenv("SHOP_PROFILE")) {
             packed::RunStats total;
             for (const auto& s:stats) {
@@ -601,7 +667,8 @@ int main(int argc,char** argv) try {
         if (compact) {
             mark("packed links, events and clicks");
             summarize(compact->events,compact->clicks,compact->base,ctx,
-                      compact->dense && !getenv("SHOP_REGROUP_ALL"));
+                      compact->dense && !getenv("SHOP_REGROUP_ALL"),
+                      compact->segmented ? &compact->segments : nullptr);
         }
     }
     if (!compact) {
@@ -614,8 +681,8 @@ int main(int argc,char** argv) try {
         UserParts empty(stage,0,true);
         empty.flush();
     }
-    CampaignDays totals;
-    for (const auto& shard:partial) for (auto& [key,t]:shard) totals[key].add(t);
+    CampaignMap totals;
+    for (const auto& shard:partial) shard.merge(totals);
     if (direct) {
         parquet::Table table{{"campaign_id",parquet::String},{"channel",parquet::String},
             {"day",parquet::Date},{"sessions",parquet::Int64},{"purchasing_sessions",parquet::Int64},
